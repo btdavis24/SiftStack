@@ -32,6 +32,28 @@ import config
 
 logger = logging.getLogger(__name__)
 
+
+# Default county set when caller doesn't specify. Spans both target
+# markets — TN (Knox, Blount) and KY (Jefferson). Add new counties here
+# as the platform expands.
+_DEFAULT_COUNTIES = ["Knox", "Blount", "Jefferson"]
+
+
+def _state_from_zip(zip_code: str) -> str:
+    """Infer 2-letter state from a 5-digit ZIP. Covers SiftStack's target
+    markets and falls back to "TN" for unknown prefixes (legacy default).
+
+      37xxx, 38xxx → TN  (Knoxville, Memphis, Nashville, etc.)
+      40xxx, 41xxx, 42xxx → KY (Louisville, Lexington, etc.)
+    """
+    z = (zip_code or "").strip()
+    if len(z) >= 1 and z[0] == "4":
+        return "KY"
+    if len(z) >= 1 and z[0] == "3":
+        return "TN"
+    return "TN"
+
+
 # ── Buyer classification thresholds ───────────────────────────────────
 WHOLESALE_MAX_HOLD_DAYS = 72
 WHOLETAIL_MAX_HOLD_DAYS = 90
@@ -383,7 +405,7 @@ def export_buyers_csv(investors: list[InvestorProfile], output_path: str = "") -
                 "owner_name": inv.person_behind or inv.name,
                 "address": "",
                 "city": "",
-                "state": "TN",
+                "state": _state_from_zip(inv.primary_zip),
                 "zip": inv.primary_zip,
                 "tags": f"buyer,{inv.buyer_type},buyer_score_{round(inv.score)}",
                 "lists": "Cash Buyers",
@@ -405,7 +427,7 @@ def run_buyer_prospecting(counties: list[str] | None = None,
 
     Returns dict with report and output paths.
     """
-    counties = counties or ["Knox", "Blount"]
+    counties = counties or _DEFAULT_COUNTIES
     county_str = ", ".join(counties)
     logger.info("Starting buyer prospecting for: %s (last %d months)", county_str, months_back)
 

@@ -64,3 +64,13 @@ _brand_tmp/
 _tmp_skill/
 autoresearch/
 .pytest_cache/
+
+# Personal research scratch (contains target PII — keep local only)
+tmp_research/
+scripts/dp_*.py
+scripts/find_bowling*.py
+scripts/find_harkins*.py
+scripts/dump_kcoj_today.py
+
+# DataSift UI captures (contain customer PII visible in records list)
+datasift_*.png

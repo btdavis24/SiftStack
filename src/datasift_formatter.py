@@ -104,6 +104,15 @@ DATASIFT_COLUMNS = [
     "Entity Type",
     "Entity Contact",
     "Entity Contact Role",
+    # ── KY probate enrichment (Phase 2) ──
+    # These are populated by the Jefferson PVA + Deeds + CourtNet pipeline.
+    # On a fresh DataSift account these need to exist as custom fields under
+    # the "SiftStack" group; otherwise they're stored as freeform text in
+    # the Notes column instead.
+    "Estate Attorney",          # CourtNet AP party — probate attorney for outreach
+    "Property Owner Status",    # direct | estate | trust | heir_recent
+    "Mortgage Balance",         # Estimated remaining ($) from JCD deeds + amortization
+    "Current Property Holder",  # Name from deed chain (decedent / trust / heir / "self")
 ]
 
 
@@ -220,6 +229,7 @@ NOTICE_TYPE_TO_LIST = {
     "eviction": "Eviction",
     "code_violation": "Code Violation",
     "divorce": "Divorce",
+    "lis_pendens": "Pre-Foreclosure",
 }
 
 
@@ -531,6 +541,34 @@ def _build_property_section(notice: NoticeData) -> str:
             tax_str += f" ({notice.tax_delinquent_years} yrs)"
         parts.append(tax_str)
 
+    # KY probate enrichment (Phase 2) — surfaces deed-chain + mortgage +
+    # CourtNet attorney signals in Notes so they show up even on DataSift
+    # accounts that don't have the new custom fields configured yet.
+    if notice.estate_attorney_name:
+        parts.append(f"Atty: {notice.estate_attorney_name}")
+
+    if notice.property_owner_status:
+        status_label = notice.property_owner_status.replace("_", " ")
+        if notice.current_property_holder and notice.property_owner_status != "self":
+            parts.append(f"Status: {status_label} ({notice.current_property_holder})")
+        else:
+            parts.append(f"Status: {status_label}")
+
+    if notice.mortgage_balance_estimate:
+        if notice.mortgage_balance_estimate == "0":
+            parts.append("Mortgage: paid off")
+        else:
+            mtg = f"Mortgage Bal: ${notice.mortgage_balance_estimate}"
+            if notice.mortgage_origination_date:
+                mtg += f" (orig {notice.mortgage_origination_date})"
+            parts.append(mtg)
+
+    if notice.heir_transferred_to:
+        xfer = f"Recent transfer: {notice.heir_transferred_to} on {notice.heir_transfer_date}"
+        if notice.heir_same_surname == "yes":
+            xfer += " (family)"
+        parts.append(xfer)
+
     if notice.source_url:
         parts.append(f"Source: {notice.source_url}")
 
@@ -780,6 +818,15 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Entity Type": notice.entity_type,
         "Entity Contact": notice.entity_person_name,
         "Entity Contact Role": notice.entity_person_role,
+        # ── KY probate enrichment (Phase 2) ──
+        # ``mortgage_balance_estimate`` is stored as integer dollars
+        # (e.g. "104096"); leave the raw string so DataSift formats it as
+        # a number on its end. Empty string means "unknown" — the column
+        # stays blank rather than reading "0" as a confirmed paid-off.
+        "Estate Attorney": notice.estate_attorney_name,
+        "Property Owner Status": notice.property_owner_status,
+        "Mortgage Balance": notice.mortgage_balance_estimate,
+        "Current Property Holder": notice.current_property_holder,
     }
 
 

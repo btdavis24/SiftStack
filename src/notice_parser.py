@@ -138,12 +138,39 @@ class NoticeData:
     run_id: str = ""                   # Unique pipeline run identifier for data lineage
     # Court case metadata (populated by court docket scrapers — e.g. KCOJ, Jefferson Deeds)
     case_number: str = ""              # Court case number (e.g. "26-P-001544" for KY probate)
+    # Deed-history enrichment (KY probate; Phase 2b)
+    mortgage_balance_estimate: str = ""  # Remaining mortgage balance ($) estimated from origination + elapsed years
+    mortgage_origination_date: str = ""  # YYYY-MM-DD of the most recent unreleased mortgage
+    mortgage_original_amount: str = ""   # Original loan amount ($) from the mortgage document
+    # Heir-property detection (KY probate; Phase 2b.5)
+    property_owner_status: str = ""      # "direct" | "estate" | "trust" | "heir_recent" | "" (not confirmed)
+    heir_transferred_to: str = ""        # Grantee name from decedent's most recent transfer deed (within 24mo)
+    heir_transfer_date: str = ""         # YYYY-MM-DD of that transfer
+    heir_same_surname: str = ""          # "yes" if grantee surname matches decedent's (family transfer heuristic)
+    # Current-title-holder discovered by walking the decedent's deed chain (Phase 2b)
+    # Populated whether or not the holder differs from the decedent — used by
+    # Phase 2a as the primary PVA search target for the property-confirmation step.
+    current_property_holder: str = ""        # Name to search PVA with (decedent / estate / trust / heir)
+    current_holder_relationship: str = ""    # "self" | "trust" | "heir_recent" | "" (no deed chain)
+    # Street address extracted from the active mortgage PDF (Phase 2b OCR).
+    # Used as a fallback PVA-search input when name-based PVA search misses.
+    # Solves cases like married-name PVA records or middle-initial mismatches.
+    deed_discovered_address: str = ""        # e.g. "7802 RIVA RIDGE PT" — no city/state/zip
+    deed_discovered_parcel_id: str = ""      # 12-char Jefferson PIDN if extracted from deed
+    # CourtNet case-detail enrichment (KY probate; Phase 2c)
+    estate_attorney_name: str = ""       # Attorney representing the estate (party-type AP)
+    courtnet_party_types: str = ""       # Pipe-separated party-type codes observed on the case (AP|FI|AD|PE|HE|...)
 
 
-# ── Known TN cities in Knox & Blount counties ─────────────────────────
-# Sorted longest-first so "Lenoir City" matches before "City"
-TN_CITIES: list[str] = sorted(
+# ── Known cities in target markets ────────────────────────────────────
+# TN: Knox & Blount counties. KY: Jefferson County (Louisville metro).
+# Sorted longest-first so "Lenoir City" matches before "City".
+# Louisville is the tricky one — it's both a small TN town (in Blount) and
+# the Jefferson KY seat. Disambiguation happens downstream via state/zip,
+# not here.
+KNOWN_CITIES: list[str] = sorted(
     [
+        # TN — Knox & Blount metro
         "Knoxville", "Maryville", "Alcoa", "Farragut", "Powell",
         "Lenoir City", "Loudon", "Oak Ridge", "Clinton", "Sevierville",
         "Pigeon Forge", "Gatlinburg", "Karns", "Halls", "Concord",
@@ -151,13 +178,39 @@ TN_CITIES: list[str] = sorted(
         "Corryton", "Mascot", "Strawberry Plains", "New Market",
         "Kodak", "Dandridge", "Bean Station", "Jefferson City",
         "Morristown", "Madisonville", "Vonore", "Greenback",
+        # KY — Jefferson County / Louisville metro
+        "Anchorage", "Audubon Park", "Bancroft", "Barbourmeade",
+        "Bellemeade", "Bellewood", "Beechwood Village", "Blue Ridge Manor",
+        "Briarwood", "Broeck Pointe", "Brownsboro Farm", "Brownsboro Village",
+        "Cambridge", "Coldstream", "Creekside", "Crossgate", "Douglass Hills",
+        "Fincastle", "Forest Hills", "Glenview", "Glenview Hills",
+        "Glenview Manor", "Goose Creek", "Graymoor-Devondale", "Green Spring",
+        "Heritage Creek", "Hickory Hill", "Hills and Dales", "Hollow Creek",
+        "Hollyvilla", "Houston Acres", "Hurstbourne", "Hurstbourne Acres",
+        "Indian Hills", "Jeffersontown", "Kingsley", "Langdon Place",
+        "Lincolnshire", "Lyndon", "Lynnview", "Manor Creek", "Maryhill Estates",
+        "Meadow Vale", "Meadowbrook Farm", "Meadowview Estates", "Middletown",
+        "Minor Lane Heights", "Mockingbird Valley", "Moorland", "Murray Hill",
+        "Northfield", "Norwood", "Old Brownsboro Place", "Parkway Village",
+        "Plantation", "Poplar Hills", "Prospect", "Richlawn", "Riverwood",
+        "Rolling Fields", "Rolling Hills", "Saint Matthews", "St Matthews",
+        "Saint Regis Park", "St Regis Park", "Seneca Gardens", "Shively",
+        "South Park View", "Spring Mill", "Spring Valley", "Strathmoor Manor",
+        "Strathmoor Village", "Sycamore", "Ten Broeck", "Thornhill",
+        "Watterson Park", "Wellington", "West Buechel", "Westwood",
+        "Wildwood", "Windy Hills", "Woodland Hills", "Woodlawn Park",
+        "Worthington Hills", "Buechel", "Fern Creek", "Fairdale", "Highview",
+        "Newburg", "Okolona", "Pleasure Ridge Park", "Valley Station",
     ],
     key=len,
     reverse=True,
 )
 
+# Back-compat alias — some external callers may still import TN_CITIES.
+TN_CITIES = KNOWN_CITIES
+
 # Set version for O(1) membership tests in standalone address validation
-_KNOWN_CITIES_SET: set[str] = {c.title() for c in TN_CITIES}
+_KNOWN_CITIES_SET: set[str] = {c.title() for c in KNOWN_CITIES}
 
 # ── Reusable suffix pattern ──────────────────────────────────────────
 # Word-boundary at the end prevents matching "Cir" inside "Circuit", etc.
@@ -208,10 +261,14 @@ _PROP_INDICATOR = (
     r")"
 )
 
-# Optional ", Knox County" or ", Blount County" between city and state
+# Optional ", Knox County" / ", Jefferson County" etc. between city and state
 _OPTIONAL_COUNTY = r"(?:\s*[,.]\s*\w+\s+County)?"
 
-# FULL match: indicator + address + city + [county] + Tennessee/TN + zip
+# Reusable state fragment — covers TN and KY (the two states we currently target).
+# Tennessee | Tenn. | TN | Kentucky | Ky. | KY
+_STATE = r"(?:Tennessee|Tenn\.?|TN|Kentucky|Ky\.?|KY)"
+
+# FULL match: indicator + address + city + [county] + state + zip
 # Captures (address, city, zip) all from the same context.
 FULL_PROPERTY_RE = re.compile(
     _PROP_INDICATOR
@@ -222,7 +279,7 @@ FULL_PROPERTY_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + _STATE
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -234,7 +291,7 @@ PROPERTY_ADDR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# "located at ADDRESS, CITY, TN ZIP" — secondary, used for tax sales
+# "located at ADDRESS, CITY, STATE ZIP" — secondary, used for tax sales.
 # We validate the result against the blacklist to filter auction locations.
 LOCATED_AT_FULL_RE = re.compile(
     r"located\s+at\s+"
@@ -243,7 +300,7 @@ LOCATED_AT_FULL_RE = re.compile(
     + r"([\w][\w\s]*?)"
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + _STATE
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",
     re.IGNORECASE,
@@ -254,7 +311,7 @@ LOCATED_AT_ADDR_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Standalone "ADDRESS, CITY, TN ZIP" — no indicator phrase required.
+# Standalone "ADDRESS, CITY, STATE ZIP" — no indicator phrase required.
 # Only used for tax_sale / tax_lien notices as a last resort before giving up.
 STANDALONE_ADDR_RE = re.compile(
     _ADDR_PART
@@ -262,7 +319,7 @@ STANDALONE_ADDR_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + _STATE
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -290,6 +347,15 @@ _KNOWN_BAD_ADDRS = [
     "800 south gay",
     "300 main street",      # Blount County courthouse
     "300 main st",
+    # Jefferson County KY (Louisville)
+    "700 w jefferson",      # Louis D. Brandeis Hall of Justice
+    "700 west jefferson",
+    "600 w jefferson",      # Jefferson Judicial Center
+    "600 west jefferson",
+    "527 w jefferson",      # Louisville Metro Hall
+    "527 west jefferson",
+    "514 w liberty",        # Jefferson County Clerk
+    "514 west liberty",
 ]
 
 
@@ -321,9 +387,12 @@ def _is_valid_address(addr: str) -> bool:
     return True
 
 
-# ── TN zip code ──────────────────────────────────────────────────────
-# TN zips range from 37010 to 38589 — require 37xxx or 38xxx prefix
-ZIP_RE = re.compile(r"\b(3[78]\d{3})(?:-\d{4})?\b")
+# ── Zip code ─────────────────────────────────────────────────────────
+# TN:  37xxx / 38xxx (Knox, Blount, surrounding East TN counties)
+# KY:  40xxx / 41xxx / 42xxx — Louisville/Jefferson is 402xx specifically,
+#      but keep the whole KY range so we don't silently drop valid PR/DM
+#      mailing addresses from neighboring counties.
+ZIP_RE = re.compile(r"\b(3[78]\d{3}|4[012]\d{3})(?:-\d{4})?\b")
 
 # Zips to reject when found via fallback (no address context):
 # Courthouse / auction / law-office zips that commonly appear in notice text
@@ -333,12 +402,15 @@ _COURTHOUSE_ZIPS = {
     "38103",  # Memphis (law firms often referenced)
     "38101",  # Memphis PO Box area
     "37219",  # Nashville (state offices)
+    "40202",  # Downtown Louisville (Jefferson Judicial Center, Metro Hall)
+    "40601",  # Frankfort (KY state offices)
 }
 
 # Expected zip prefixes by county (for fallback validation)
 _COUNTY_ZIP_PREFIXES: dict[str, list[str]] = {
-    "Knox":   ["377", "378", "379"],
-    "Blount": ["377", "378"],
+    "Knox":      ["377", "378", "379"],
+    "Blount":    ["377", "378"],
+    "Jefferson": ["402"],  # Louisville metro (KY). 402xx is Jefferson County.
 }
 
 
@@ -445,9 +517,9 @@ DECEDENT_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Probate — PR mailing address (street + city + TN + zip after the PR title)
+# Probate — PR mailing address (street + city + state + zip after the PR title)
 # Anchors from the PR title keyword, skips over name/title (non-digit chars),
-# then captures: (1) street address, (2) city, (3) zip
+# then captures: (1) street address, (2) city, (3) state, (4) zip
 PR_ADDRESS_RE = re.compile(
     r"(?:Personal\s+Representative(?:\(S\))?|Executor|Executrix|Administrator|Administratrix)"
     r"[^0-9]{3,80}"                   # skip PR name + optional title suffix
@@ -459,11 +531,23 @@ PR_ADDRESS_RE = re.compile(
     r"\s*[,.\s]+\s*"
     r"([A-Za-z][\w\s]*?)"             # city
     r"\s*[,.]\s*"
-    r"(?:Tennessee|Tenn\.?|TN)"
+    r"(" + _STATE + r")"              # state (captured)
     r"\s*[,.\s]*"
     r"(\d{5})",                        # zip
     re.IGNORECASE,
 )
+
+
+def _normalize_state(raw: str) -> str:
+    """Collapse a matched state fragment to the 2-letter abbreviation."""
+    if not raw:
+        return ""
+    s = raw.strip().upper().rstrip(".")
+    if s in ("TN", "TENNESSEE", "TENN"):
+        return "TN"
+    if s in ("KY", "KENTUCKY"):
+        return "KY"
+    return s
 
 # Names that are clearly not real person names
 _INVALID_NAMES = {
@@ -589,8 +673,9 @@ _COURTHOUSE_COUNTY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Counties we care about — notices for other counties are false positives
-_TARGET_COUNTIES = {"knox", "blount"}
+# Counties we care about — notices for other counties are false positives.
+# TN: Knox, Blount.  KY: Jefferson (Louisville metro).
+_TARGET_COUNTIES = {"knox", "blount", "jefferson"}
 
 
 def is_target_county(text: str, search_county: str) -> bool:
@@ -601,8 +686,9 @@ def is_target_county(text: str, search_county: str) -> bool:
     Union, etc.  We detect this by looking at Register's Office and Courthouse
     references which indicate where the property actually is.
 
-    Returns True if the property appears to be in Knox or Blount County (or if
-    we can't determine the county — benefit of the doubt).
+    Returns True if the property appears to be in one of our target counties
+    (Knox, Blount, Jefferson) or if we can't determine the county — benefit of
+    the doubt.
     """
     # Find all Register's Office mentions — the first one is typically the
     # property's recording county (later mentions may be trustee appointments)
@@ -760,7 +846,12 @@ async def parse_notice_page(
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
-                notice.owner_state = llm_result.get("owner_state") or "TN"
+                notice.owner_state = (
+                    llm_result.get("owner_state")
+                    or notice.owner_state
+                    or notice.state
+                    or "TN"
+                )
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
         else:
@@ -952,16 +1043,16 @@ def _get_context_before(text: str, pos: int, chars: int) -> str:
 def _extract_city_zip_near(notice: NoticeData, text: str, addr_end: int) -> None:
     """Extract city and zip from the text near the end of the address match.
 
-    Looks in the 200 characters after the address for "City, TN ZIP" or
-    "City, Tennessee ZIP".
+    Looks in the 200 characters after the address for "City, STATE ZIP".
+    STATE covers TN and KY full names + abbreviations.
     """
     window = text[addr_end:addr_end + 200]
 
-    # Try "CITY, [County,] TN ZIP" or "CITY, [County,] Tennessee ZIP"
+    # Try "CITY, [County,] STATE ZIP" (TN or KY, full or abbreviated)
     city_state_re = re.compile(
         r"[,.\s]+([\w][\w\s]*?)"
         r"(?:\s*[,.]\s*\w+\s+County)?"   # optional county
-        r"\s*[,.]\s*(?:Tennessee|Tenn\.?|TN)"
+        r"\s*[,.]\s*" + _STATE +
         r"\s*[,.\s]*(\d{5}(?:-\d{4})?)?",
         re.IGNORECASE,
     )
@@ -972,14 +1063,14 @@ def _extract_city_zip_near(notice: NoticeData, text: str, addr_end: int) -> None
             notice.zip = m.group(2)
         return
 
-    # Fallback: find a known TN city in the window
+    # Fallback: find a known city in the window
     window_upper = window.upper()
-    for city in TN_CITIES:
+    for city in KNOWN_CITIES:
         if city.upper() in window_upper:
             notice.city = city
             break
 
-    # Find a TN zip near the address
+    # Find a zip near the address
     zip_match = ZIP_RE.search(window)
     if zip_match:
         notice.zip = zip_match.group(1)
@@ -998,12 +1089,12 @@ def _is_valid_fallback_zip(zip_code: str, county: str) -> bool:
 def _extract_city_zip_fallback(notice: NoticeData, text: str) -> None:
     """Last resort: find city/zip anywhere in the notice text.
 
-    Only used when no address was found. Finds the first known TN city
-    and first TN zip code, but rejects courthouse/out-of-county zips.
+    Only used when no address was found. Finds the first known city and first
+    in-state zip code, but rejects courthouse/out-of-county zips.
     """
     if not notice.city:
         text_upper = text.upper()
-        for city in TN_CITIES:
+        for city in KNOWN_CITIES:
             if city.upper() in text_upper:
                 notice.city = city
                 break
@@ -1094,11 +1185,12 @@ def _parse_pr_address(notice: NoticeData) -> None:
             street = street.title()
         notice.owner_street = street
         notice.owner_city = _clean_city(match.group(2))
-        notice.owner_state = "TN"
-        notice.owner_zip = match.group(3)
+        notice.owner_state = _normalize_state(match.group(3)) or notice.state or "TN"
+        notice.owner_zip = match.group(4)
         logger.debug(
-            "PR address: %s, %s, TN %s",
-            notice.owner_street, notice.owner_city, notice.owner_zip,
+            "PR address: %s, %s, %s %s",
+            notice.owner_street, notice.owner_city,
+            notice.owner_state, notice.owner_zip,
         )
 
 

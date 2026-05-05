@@ -345,48 +345,195 @@ def run_enrichment_pipeline(
         logger.warning("No records remaining after filtering")
         return notices
 
-    # ── Step 3c: Probate Property Lookup ────────────────────────────
-    # For probate records without a property address, search Knox Tax API
-    # by the decedent's name to find their property.
+    # ── Step 3b.5: KY CourtNet Case Parties ──────────────────────────
+    # For Jefferson probate records with a case_number (populated by the
+    # KCOJ docket scraper), look up the case's party list via CourtNet 2.0
+    # guest access. Populates owner_name with the executor/administrator
+    # when visible, and estate_attorney_name with the estate's attorney.
+    # Runs BEFORE property lookup so downstream steps can use the resolved
+    # PR name as a fallback search term. Async-only (uses Playwright).
+    courtnet_candidates = [
+        n for n in notices
+        if n.notice_type == "probate"
+        and n.county.lower() == "jefferson"
+        and n.case_number.strip()
+        and not n.owner_name.strip()
+    ]
+    if courtnet_candidates and config.CAPTCHA_API_KEY:
+        logger.info(
+            "── Step 3b.5: KY CourtNet Case Parties (%d candidate(s)) ──",
+            len(courtnet_candidates),
+        )
+        try:
+            import asyncio
+            from kcoj_case_detail import enrich_case_parties
+            try:
+                asyncio.get_running_loop()
+                # Already in an event loop (pipeline called from async context)
+                logger.warning(
+                    "  [CourtNet] pipeline already in an event loop — "
+                    "scheduling is caller's responsibility; skipping"
+                )
+            except RuntimeError:
+                asyncio.run(enrich_case_parties(courtnet_candidates))
+            filled_exec = sum(1 for n in courtnet_candidates if n.owner_name.strip())
+            filled_atty = sum(1 for n in courtnet_candidates if n.estate_attorney_name.strip())
+            logger.info(
+                "  [CourtNet] owner_name filled: %d/%d | attorney filled: %d/%d",
+                filled_exec, len(courtnet_candidates),
+                filled_atty, len(courtnet_candidates),
+            )
+        except ImportError:
+            logger.warning("  [CourtNet] kcoj_case_detail not available — skipping")
+        except Exception as e:
+            logger.warning("  [CourtNet] case-detail lookup failed: %s", e)
+    elif courtnet_candidates and not config.CAPTCHA_API_KEY:
+        logger.info(
+            "── Step 3b.5: KY CourtNet (skipped — CAPTCHA_API_KEY not set) ──"
+        )
+
+    # ── Step 3c: KY Deed History (Phase 2b) ─────────────────────────
+    # Reversed-flow architecture: deeds run BEFORE the PVA lookup.
+    # The deed scraper finds the decedent's deed records, walks the
+    # chain to identify the current title holder (decedent / estate /
+    # trust / heir), and captures mortgage history. The discovered
+    # holder name then drives Phase 2a's PVA search — bypassing the
+    # ~80% miss rate of "PVA-by-decedent-name" on real probate cases.
+    ky_mortgage_candidates = [
+        n for n in notices
+        if n.county.lower() == "jefferson"
+        and (n.decedent_name.strip() or n.owner_name.strip())
+        and not n.mortgage_balance_estimate.strip()
+    ]
+    if ky_mortgage_candidates:
+        logger.info(
+            "── Step 3c: KY Deed History + current-holder discovery (%d candidates) ──",
+            len(ky_mortgage_candidates),
+        )
+        try:
+            from jefferson_deeds_scraper import enrich_mortgage_balances
+            enrich_mortgage_balances(ky_mortgage_candidates)
+            enriched = sum(1 for n in ky_mortgage_candidates if n.mortgage_original_amount.strip())
+            holders = sum(1 for n in ky_mortgage_candidates if n.current_property_holder.strip())
+            logger.info(
+                "  [Jefferson] Active mortgage: %d/%d | Current-holder identified: %d/%d",
+                enriched, len(ky_mortgage_candidates),
+                holders, len(ky_mortgage_candidates),
+            )
+        except ImportError:
+            logger.warning("  [Jefferson] jefferson_deeds_scraper not available — skipping")
+        except Exception as e:
+            logger.warning("  [Jefferson] Deed history lookup failed: %s", e)
+
+    # ── Step 3d: Probate Property Lookup (Phase 2a) ─────────────────
+    # PVA lookup, gated on either a decedent name or a deed-discovered
+    # current-property-holder. Knox uses the legacy decedent-only path;
+    # Jefferson uses the new current_property_holder when populated by
+    # Step 3c, falling back to decedent_name otherwise.
     probate_no_addr = [
         n for n in notices
         if n.notice_type == "probate"
         and not n.address.strip()
         and n.decedent_name.strip()
-        and n.county.lower() == "knox"
     ]
     if probate_no_addr:
-        logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
+        logger.info("── Step 3d: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
+        by_county: dict[str, list] = {}
+        for n in probate_no_addr:
+            by_county.setdefault(n.county.lower(), []).append(n)
+
+        for county_key, group in by_county.items():
+            if county_key == "knox":
+                try:
+                    from tax_enricher import _probate_property_lookup
+                    _probate_property_lookup(group)
+                    found = sum(1 for n in group if n.address.strip())
+                    logger.info("  [Knox] Property address found: %d/%d", found, len(group))
+                except ImportError:
+                    logger.warning("  [Knox] _probate_property_lookup not available — skipping")
+                except Exception as e:
+                    logger.warning("  [Knox] Probate property lookup failed: %s", e)
+            elif county_key == "jefferson":
+                try:
+                    from kentucky_pva_lookup import probate_property_lookup as _ky_probate_lookup
+                    _ky_probate_lookup(group)
+                    found = sum(1 for n in group if n.address.strip())
+                    logger.info("  [Jefferson] Property address found: %d/%d", found, len(group))
+                except ImportError:
+                    logger.warning("  [Jefferson] kentucky_pva_lookup not available — skipping")
+                except Exception as e:
+                    logger.warning("  [Jefferson] PVA probate lookup failed: %s", e)
+            else:
+                logger.info(
+                    "  [%s] %d record(s) — no property-lookup backend configured",
+                    county_key.title(), len(group),
+                )
+
+    # Step 3d.5 (separate heir PVA lookup) was removed — Phase 2a now
+    # uses ``current_property_holder`` directly from Phase 2b's deed
+    # chain analysis, which catches the heir-recent / trust / estate
+    # paths in a single search.
+
+    # ── Step 3e: KY Equity Estimator ─────────────────────────────────
+    # Compute estimated_equity + equity_percent for Jefferson records from
+    # the PVA assessed value (Step 3c) and mortgage balance (Step 3d). Uses
+    # an 85%-of-assessed fallback when mortgage signal is unknown. Runs
+    # last in the KY block so it sees the final values from 3c/3d.
+    ky_equity_candidates = [
+        n for n in notices
+        if n.county.lower() == "jefferson"
+        and n.estimated_value.strip()
+        and not n.estimated_equity.strip()
+    ]
+    if ky_equity_candidates:
         try:
-            from tax_enricher import _probate_property_lookup
-            _probate_property_lookup(probate_no_addr)
-            found = sum(1 for n in probate_no_addr if n.address.strip())
-            logger.info("  Property address found: %d/%d", found, len(probate_no_addr))
+            from kentucky_equity_estimator import enrich_equity
+            count = enrich_equity(ky_equity_candidates)
+            logger.info(
+                "── Step 3e: KY Equity Estimator — %d/%d enriched ──",
+                count, len(ky_equity_candidates),
+            )
         except ImportError:
-            logger.warning("  _probate_property_lookup not available — skipping")
+            logger.warning("  [Jefferson] kentucky_equity_estimator not available — skipping")
         except Exception as e:
-            logger.warning("  Probate property lookup failed: %s", e)
+            logger.warning("  [Jefferson] Equity estimation failed: %s", e)
 
     # ── Step 4: Parcel Address Lookup ────────────────────────────────
+    # Dispatch per-county: given a parcel_id, resolve to a street address via
+    # the county's assessor API. Same dispatch pattern as Step 3c.
     if not opts.skip_parcel_lookup and not opts.skip_tax:
-        candidates = [
-            n
-            for n in notices
-            if n.parcel_id.strip() and n.county.lower() == "knox"
-        ]
+        candidates = [n for n in notices if n.parcel_id.strip()]
         if candidates:
+            by_county = {}
+            for n in candidates:
+                by_county.setdefault(n.county.lower(), []).append(n)
+
             logger.info(
                 "── Step 4: Parcel Address Lookup (%d candidates) ──",
                 len(candidates),
             )
-            try:
-                from tax_enricher import lookup_parcel_addresses
-
-                lookup_parcel_addresses(notices)
-            except ImportError:
-                logger.warning("  tax_enricher not available — skipping")
-            except Exception as e:
-                logger.warning("  Parcel address lookup failed: %s", e)
+            for county_key, group in by_county.items():
+                if county_key == "knox":
+                    try:
+                        from tax_enricher import lookup_parcel_addresses
+                        lookup_parcel_addresses(group)
+                    except ImportError:
+                        logger.warning("  [Knox] tax_enricher not available — skipping")
+                    except Exception as e:
+                        logger.warning("  [Knox] Parcel address lookup failed: %s", e)
+                elif county_key == "jefferson":
+                    try:
+                        from kentucky_pva_lookup import lookup_parcel_addresses as _ky_parcel_lookup
+                        _ky_parcel_lookup(group)
+                    except ImportError:
+                        logger.warning("  [Jefferson] kentucky_pva_lookup not available — skipping")
+                    except Exception as e:
+                        logger.warning("  [Jefferson] PVA parcel lookup failed: %s", e)
+                else:
+                    logger.info(
+                        "  [%s] %d parcel(s) — no parcel-lookup backend configured",
+                        county_key.title(), len(group),
+                    )
         else:
             logger.info("── Step 4: Parcel Address Lookup (no candidates) ──")
     elif opts.skip_parcel_lookup:

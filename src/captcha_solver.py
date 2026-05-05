@@ -10,10 +10,15 @@ checkbox before the full notice text is revealed.  Flow:
   6. Verify the notice content is now visible
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
+from typing import TYPE_CHECKING
 
-from playwright.async_api import Page, TimeoutError as PwTimeout
+if TYPE_CHECKING:
+    from playwright.async_api import Page
+
 from twocaptcha import TwoCaptcha
 
 import config
@@ -28,6 +33,8 @@ async def solve_captcha_and_view(page: Page) -> bool:
     Retries up to MAX_RETRIES times on failure.
     Returns True if the notice text is now visible, False otherwise.
     """
+    from playwright.async_api import TimeoutError as PwTimeout  # noqa: PLC0415
+
     if not config.CAPTCHA_API_KEY:
         logger.error("CAPTCHA_API_KEY not set — cannot solve CAPTCHA")
         return False

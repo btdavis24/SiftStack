@@ -34,6 +34,73 @@ SIGNIN_URL = "https://www.ancestry.com/account/signin"
 PAGE_LOAD_FILE = Path(__file__).resolve().parent.parent / ".ancestry_page_loads.json"
 DAILY_LIMIT = 100
 
+# ── Multi-state geography ──────────────────────────────────────────
+# These tables drive state/city/county awareness across all the search
+# helpers below. SiftStack runs against both TN (Knox/Blount) and KY
+# (Jefferson, expanding) markets — adding a new county for either state
+# means appending to the maps below; no code changes required.
+
+_STATE_FULL_NAMES = {
+    "TN": "Tennessee",
+    "AL": "Alabama",
+    "GA": "Georgia",
+    "KY": "Kentucky",
+    "NC": "North Carolina",
+    "VA": "Virginia",
+}
+
+
+def _state_full_name(state_code: str) -> str:
+    """'TN' → 'Tennessee', 'KY' → 'Kentucky'. Returns the input on miss."""
+    return _STATE_FULL_NAMES.get((state_code or "").strip().upper(), state_code or "Tennessee")
+
+
+# City → list of plausible county names. Used by _location_matches() to
+# score SSDI/obituary location strings against the notice's expected county.
+# Add lowercase entries; both TN and KY markets share the same map.
+_CITY_TO_COUNTY = {
+    # TN — Knox & Blount metro
+    "knoxville":  ["knox"],
+    "farragut":   ["knox"],
+    "powell":     ["knox"],
+    "corryton":   ["knox"],
+    "halls":      ["knox"],
+    "concord":    ["knox"],
+    "karns":      ["knox"],
+    "maryville":  ["blount"],
+    "alcoa":      ["blount"],
+    "friendsville": ["blount"],
+    "townsend":   ["blount"],
+    "rockford":   ["blount"],
+    # KY — Jefferson (Louisville metro)
+    "louisville":      ["jefferson"],
+    "jeffersontown":   ["jefferson"],
+    "shively":         ["jefferson"],
+    "middletown":      ["jefferson"],
+    "saint matthews":  ["jefferson"],
+    "st matthews":     ["jefferson"],
+    "lyndon":          ["jefferson"],
+    "anchorage":       ["jefferson"],
+    "prospect":        ["jefferson"],
+    "fairdale":        ["jefferson"],
+    "fern creek":      ["jefferson"],
+    "highview":        ["jefferson"],
+    "okolona":         ["jefferson"],
+    "valley station":  ["jefferson"],
+    "pleasure ridge park": ["jefferson"],
+    "newburg":         ["jefferson"],
+    "buechel":         ["jefferson"],
+}
+
+# Regex tokens for location-extraction from result-row text. Covers both
+# TN and KY markets. Add new tokens (e.g. "Hardin" for Owensboro) when
+# expanding to additional KY counties.
+_LOCATION_TOKENS_RE = re.compile(
+    r"Tennessee|\bTN\b|Knoxville|Knox\s+County|Blount"
+    r"|Kentucky|\bKY\b|Louisville|Jefferson\s+County",
+    re.IGNORECASE,
+)
+
 # ── Page load tracking ──────────────────────────────────────────────
 
 
@@ -290,7 +357,7 @@ async def _search_ssdi(page, first_name: str, last_name: str, state: str = "TN",
     if state:
         loc_el = await page.query_selector("#sfs__SelfResidencePlace")
         if loc_el and await loc_el.is_visible():
-            state_name = {"TN": "Tennessee", "AL": "Alabama"}.get(state, state)
+            state_name = _state_full_name(state)
             await loc_el.fill(state_name)
             await _delay(1, 2)
             # Wait for autocomplete dropdown and select first match
@@ -508,7 +575,7 @@ async def _search_obituaries(page, first_name: str, last_name: str, state: str =
     # Navigate directly to search results URL — bypasses SPA form issues
     # Category 34 = "Death, Burial, Cemetery & Obituaries"
     import urllib.parse
-    state_name = {"TN": "Tennessee", "AL": "Alabama"}.get(state, state)
+    state_name = _state_full_name(state)
     params = {
         "name": f"{first_name}_{last_name}",
         "birth": "",
@@ -640,8 +707,7 @@ async def _search_newspapers(page, first_name: str, last_name: str, state: str =
     # Build search URL with obituary category filter
     # Newspapers.com search URL format: /search/?query=FIRSTNAME+LASTNAME&t=4268
     # t=4268 = Obituaries category (from the category dropdown)
-    state_abbr_to_full = {"TN": "Tennessee", "AL": "Alabama"}
-    state_full = state_abbr_to_full.get(state, state)
+    state_full = _state_full_name(state)
 
     query_parts = [first_name, last_name]
     search_query = " ".join(query_parts)
@@ -1018,8 +1084,8 @@ def _parse_result_row(text: str) -> dict | None:
     if birth_match:
         result["birth_date"] = birth_match.group(1).strip()
 
-    # Extract location
-    loc_match = re.search(r"(?:Tennessee|TN|Knoxville|Knox\s+County|Blount)", text, re.IGNORECASE)
+    # Extract location — accepts both TN and KY market terms
+    loc_match = _LOCATION_TOKENS_RE.search(text)
     if loc_match:
         result["location"] = loc_match.group(0).strip()
 
@@ -1072,11 +1138,7 @@ def _location_matches(location: str, state: str = "TN", city: str = "") -> tuple
       - score: 0 = no location data, 1 = right state, 2 = right county/city
     """
     loc_lower = location.lower().strip()
-    state_names = {
-        "TN": "tennessee", "AL": "alabama", "GA": "georgia",
-        "KY": "kentucky", "NC": "north carolina", "VA": "virginia",
-    }
-    state_name = state_names.get(state, state.lower())
+    state_name = _state_full_name(state).lower()
 
     # No location data — can't confirm or deny
     if not loc_lower or loc_lower.startswith("x"):
@@ -1089,26 +1151,16 @@ def _location_matches(location: str, state: str = "TN", city: str = "") -> tuple
     # Right state — base score 1
     score = 1
 
-    # Check county/city match for extra confidence
-    # SSDI locations look like: "Knox, Tennessee, USA" or "Knoxville, Knox, Tennessee"
+    # Check county/city match for extra confidence.
+    # SSDI locations look like: "Knox, Tennessee, USA" / "Knoxville, Knox, Tennessee"
+    # or "Jefferson, Kentucky, USA" / "Louisville, Jefferson, Kentucky".
     city_lower = city.lower() if city else ""
-    # Map cities to counties for Knox/Blount area
-    county_aliases = {
-        "knoxville": ["knox"],
-        "farragut": ["knox"],
-        "powell": ["knox"],
-        "corryton": ["knox"],
-        "maryville": ["blount"],
-        "alcoa": ["blount"],
-    }
-
     if city_lower:
         # Direct city name match
         if city_lower in loc_lower:
             score = 2
-        # County match via city mapping
-        counties = county_aliases.get(city_lower, [])
-        for county in counties:
+        # County match via the shared city→county map (covers TN + KY)
+        for county in _CITY_TO_COUNTY.get(city_lower, []):
             if county in loc_lower:
                 score = 2
                 break

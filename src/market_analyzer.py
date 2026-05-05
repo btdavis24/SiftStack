@@ -32,18 +32,32 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── Knox/Blount county zip codes ──────────────────────────────────────
-KNOX_ZIPS = [
+# ── County zip codes ──────────────────────────────────────────────────
+# Add a new entry to COUNTY_ZIPS to extend market analysis to another
+# county; everything downstream is data-driven from this map. Keys are
+# lowercase county names (without "County" suffix); values are lists of
+# 5-digit residential ZIPs in the county.
+KNOX_ZIPS = [   # TN — Knoxville metro
     "37901", "37902", "37909", "37912", "37914", "37915", "37916", "37917",
     "37918", "37919", "37920", "37921", "37922", "37923", "37924", "37931",
     "37932", "37934", "37938",
 ]
-BLOUNT_ZIPS = [
+BLOUNT_ZIPS = [   # TN — Maryville/Alcoa
     "37801", "37803", "37804", "37853", "37882", "37886",
 ]
+JEFFERSON_ZIPS = [   # KY — Louisville metro (Jefferson County)
+    # Core Louisville (40201–40299 range, only the populated 5-digits)
+    "40201", "40202", "40203", "40204", "40205", "40206", "40207", "40208",
+    "40209", "40210", "40211", "40212", "40213", "40214", "40215", "40216",
+    "40217", "40218", "40219", "40220", "40222", "40223", "40224", "40228",
+    "40229", "40231", "40232", "40233", "40241", "40242", "40243", "40245",
+    "40258", "40272", "40280", "40285", "40287", "40290", "40291", "40292",
+    "40293", "40294", "40295", "40296", "40297", "40298", "40299",
+]
 COUNTY_ZIPS = {
-    "knox": KNOX_ZIPS,
-    "blount": BLOUNT_ZIPS,
+    "knox":      KNOX_ZIPS,
+    "blount":    BLOUNT_ZIPS,
+    "jefferson": JEFFERSON_ZIPS,
 }
 
 # ── Scoring weights ───────────────────────────────────────────────────
@@ -433,9 +447,11 @@ def run_market_analysis(counties: list[str] | None = None,
                         output_path: str = "") -> dict:
     """Run market analysis for specified counties.
 
+    Default county list spans both target markets: TN (Knox, Blount) and
+    KY (Jefferson). Pass ``counties=["Jefferson"]`` to analyze KY alone.
     Returns dict with report data and output path.
     """
-    counties = counties or ["Knox", "Blount"]
+    counties = counties or ["Knox", "Blount", "Jefferson"]
     county_str = ", ".join(counties)
     logger.info("Starting market analysis for: %s", county_str)
 

@@ -3,22 +3,37 @@
 Uses simple HTTP POST — no login, no CAPTCHA, no Playwright required.
 Site: https://search.jeffersondeeds.com/
 
-Searches for LIS PENDENS (pre-foreclosure) filings by date range.
-Each filing contains: grantor (debtor/owner), grantees (lenders/plaintiffs),
-legal description, case number, and filing date.
+Two independent search surfaces on this site:
+
+1. **Instrument-type search** (`p6.php`, single-step) — used by
+   ``scrape_jefferson_deeds()`` for LIS PENDENS (pre-foreclosure)
+   filings by date range. Each filing contains grantor (debtor/owner),
+   grantees (lenders/plaintiffs), legal description, case number, and
+   filing date.
+
+2. **Owner-name search** (`p3.php` → `dlist.php`, two-step) — used by
+   ``enrich_mortgage_balances()`` (Phase 2b) for decedent deed history.
+   Step 1 returns a "Unique Hit List" grouping the query's matches by
+   owner name. Step 2 posts a specific owner row's colon-delimited
+   checkbox value to get that owner's actual deed records.
 
 NOTE: Louisville legal descriptions are metes-and-bounds or subdivision-lot
-format. They do NOT include street numbers. `address` is left blank; the
-enrichment pipeline can resolve the property address via the Jefferson
-County PVA or Smarty geocoding from the legal description.
+format. They do NOT include street numbers. For ``scrape_jefferson_deeds``,
+``address`` is left blank; the enrichment pipeline can resolve the property
+address via the Jefferson County PVA or Smarty geocoding from the legal
+description.
 """
 
+from __future__ import annotations
+
+import http.cookiejar
 import logging
 import random
 import re
 import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from notice_parser import NoticeData
@@ -614,3 +629,883 @@ def scrape_jefferson_deeds(
 
     logger.info("JCD: returning %d LIS PENDENS notices", len(notices))
     return notices
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Phase 2b — Owner-name search & mortgage history
+# ══════════════════════════════════════════════════════════════════════
+#
+# The name-search surface is a 2-step flow on the same site, distinct from
+# the LIS PENDENS flow above. See memory/project_jefferson_deeds_namesearch.md
+# for the hard-won param quirks.
+
+JCD_NAME_SEARCH_URL = f"{JCD_BASE_URL}/p3.php"
+JCD_DLIST_URL = f"{JCD_BASE_URL}/dlist.php"
+JCD_DISCLAIMER_URL = f"{JCD_BASE_URL}/index.php?acceptDisclaimer=true"
+
+# Jefferson County's internal id on this system for the dlist.php POST.
+# DO NOT confuse with the literal placeholder '.CNUM.' used by p3.php.
+JCD_CNUM_DLIST = "20"
+
+# Amortization assumptions for mortgage balance estimation.
+# 30-year fixed at 6% — a pragmatic middle-ground when we have no signal
+# about the loan's actual terms. Old mortgages (pre-2010) might have been
+# refinanced into lower rates; new ones (post-2022) often higher. If the
+# deed scraper ever lifts the actual interest rate out of the document,
+# these become per-record.
+_MORTGAGE_TERM_YEARS = 30
+_MORTGAGE_RATE = 0.06
+
+# Suffixes to strip when normalizing a decedent/owner name for JCD search.
+_SUFFIX_DEED_RE = re.compile(r"\b(JR|SR|II|III|IV|ESQ)\b\.?", re.IGNORECASE)
+
+
+@dataclass
+class DeedRecord:
+    """One row parsed from dlist.php — an individual deed filing."""
+    instnum: str
+    year: str
+    db: str
+    filed_date: str              # YYYY-MM-DD
+    book_page: str
+    doc_type: str                # "MORTGAGE", "DEED", "STATE LIEN", "REL MTG", etc.
+    grantor: str
+    grantee: str
+    legal_desc: str
+    detail_url: str
+    view_img: str = ""
+    xrefs: list[str] = field(default_factory=list)  # cross-referenced instnums
+
+
+def _accept_disclaimer(opener: urllib.request.OpenerDirector) -> None:
+    """Hit the disclaimer acceptance URL once per session."""
+    try:
+        req = urllib.request.Request(JCD_DISCLAIMER_URL, headers={"User-Agent": _USER_AGENT})
+        opener.open(req, timeout=20).read()
+    except Exception as exc:
+        logger.debug("JCD: disclaimer hit failed (non-fatal): %s", exc)
+
+
+def _make_opener() -> urllib.request.OpenerDirector:
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener.addheaders = [("User-Agent", _USER_AGENT)]
+    return opener
+
+
+def _parse_checkbox_value(value: str) -> tuple[str, str]:
+    """Extract (display_name, checkbox_value) from a raw VALUE attribute.
+
+    JCD's colon-delimited format:
+        <NORMALIZED>:<nametype>:<searchtype>:<itypes>:<group>:<SURNAME>:<GIVEN>
+
+    SURNAME is field 6, GIVEN is field 7 (may be empty; entities keep the
+    whole name in SURNAME). Returns the joined display name plus the
+    VALUE string as-is so we can replay it verbatim to dlist.php.
+    """
+    parts = value.split(":")
+    if len(parts) < 6:
+        return "", value
+    surname = parts[5].strip()
+    given = parts[6].strip() if len(parts) >= 7 else ""
+    display = f"{surname} {given}".strip() if given else surname
+    return display, value
+
+
+def _search_names_unique(
+    opener: urllib.request.OpenerDirector,
+    owner_name: str,
+    nametype: str = "2",
+    searchtype: str = "PA",
+) -> list[tuple[str, str, int]]:
+    """Step 1: GET p3.php. Return (display, checkbox_value, count) rows.
+
+    ``checkbox_value`` is the server's exact InstDetail[paname][] string to
+    POST back in step 2 — never synthesize it, the format has quirks
+    (e.g., entities keep ampersands in the SURNAME field while personal
+    names are split SURNAME:GIVEN across two fields).
+    """
+    params = {
+        "cnum": ".CNUM.",
+        "nametype": nametype,
+        "searchtype": searchtype,
+        "param1": owner_name,
+        "bdate": "", "edate": "",
+        "itypes[]": "ALL",
+        "group": "0",
+        "stype": "name",
+        "search": "Execute Search",
+    }
+    url = JCD_NAME_SEARCH_URL + "?" + urllib.parse.urlencode(params)
+    _delay()
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _USER_AGENT,
+            "Referer": f"{JCD_BASE_URL}/name.php",
+        })
+        with opener.open(req, timeout=60) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning("JCD name search failed for %r: %s", owner_name, exc)
+        return []
+
+    if "NO HITS FOUND" in html:
+        return []
+
+    # Count appears in a <b>N</b> cell within ~800 chars after each VALUE
+    # attribute. Use two independent walks rather than a single
+    # tag-spanning regex — the source HTML nesting varies.
+    results: list[tuple[str, str, int]] = []
+    count_re = re.compile(r"<b>\s*(\d+)\s*</b>", re.IGNORECASE)
+
+    for vm in re.finditer(r"VALUE='([^']+)'", html, re.IGNORECASE):
+        value = vm.group(1)
+        display, _ = _parse_checkbox_value(value)
+        if not display:
+            continue
+        window = html[vm.end(): vm.end() + 800]
+        cm = count_re.search(window)
+        count = int(cm.group(1)) if cm else 0
+        results.append((display, value, count))
+
+    return results
+
+
+def _score_display_name(query: str, display: str) -> float:
+    """Score how well a display name matches a query (0..1).
+
+    Query-term-all-present + adjacency > surname-only > partial.
+    """
+    q_tokens = [t for t in re.split(r"\s+", query.upper()) if t]
+    d_tokens = [t for t in re.split(r"\s+", display.upper()) if t]
+    if not q_tokens or not d_tokens:
+        return 0.0
+
+    if display.upper().strip() == query.upper().strip():
+        return 1.0
+
+    # All query tokens present in display?
+    matched = sum(1 for t in q_tokens if any(t in dt for dt in d_tokens))
+    score = matched / len(q_tokens) * 0.9
+
+    # Boost if query is a prefix of display (common case: "SMITH JOHN"
+    # matching "SMITH JOHN A" — the decedent with a middle initial)
+    if display.upper().startswith(query.upper()):
+        score = max(score, 0.85)
+    return score
+
+
+def _pick_best_name_match(
+    query: str, rows: list[tuple[str, str, int]], min_score: float = 0.6,
+) -> tuple[str, str, int] | None:
+    """Pick the display name most likely to be the same person as the query.
+
+    Returns (display, checkbox_value, count). Prefers exact match, then
+    prefix match, then substring. Rejects rows that look like LLCs / trusts
+    / unrelated aggregates when the query is a personal name.
+    """
+    if not rows:
+        return None
+
+    q_upper = query.upper()
+    corp_re = re.compile(r"\b(LLC|INC|CORP|COMPANY|BANK|CHURCH|TRUST|LP|LTD)\b")
+    query_is_personal = not corp_re.search(q_upper)
+
+    scored: list[tuple[float, str, str, int]] = []
+    for display, value, count in rows:
+        if query_is_personal and corp_re.search(display.upper()):
+            continue
+        s = _score_display_name(query, display)
+        if s >= min_score:
+            scored.append((s, display, value, count))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda x: (-x[0], -x[3]))  # score desc, then count desc
+    _, display, value, count = scored[0]
+    return display, value, count
+
+
+def _fetch_deed_list(
+    opener: urllib.request.OpenerDirector, checkbox_value: str,
+) -> str:
+    """Step 2: POST dlist.php with the server's exact checkbox value."""
+    data = urllib.parse.urlencode({
+        "InstDetail[paname][]": checkbox_value,
+        "cnum": JCD_CNUM_DLIST,
+        "bdate": "", "edate": "",
+    }).encode("utf-8")
+    _delay()
+    try:
+        req = urllib.request.Request(
+            JCD_DLIST_URL, data=data, method="POST",
+            headers={
+                "User-Agent": _USER_AGENT,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": f"{JCD_BASE_URL}/p3.php",
+            },
+        )
+        with opener.open(req, timeout=60) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning("JCD dlist fetch failed: %s", exc)
+        return ""
+
+
+# dlist.php record parsing. Records are rendered as table blocks linked to
+# pdetail.php via <a href="pdetail.php?instnum=...&year=...&db=&cnum=20">.
+# Structure of one block (whitespace collapsed):
+#   <a href="pdetail.php?instnum=XXXX&year=YYYY&db=&cnum=20">VIEW DETAILS</a>
+#   <td>GRANTOR</td>
+#   <td>GRANTEE</td>
+#   <td>INSTNUM</td>
+#   <td>MM/DD/YYYY</td>
+#   <td>L BBBB PPP</td>  (book/page)
+#   <td>DOC TYPE</td>
+#   <td>Y/N</td>  (image on file)
+#   ... optionally Xref block ...
+_DLIST_PDETAIL_A = re.compile(
+    r"""href=['"]?pdetail\.php\?instnum=(\d+)&(?:amp;)?year=(\d+)&(?:amp;)?db=(\d*)&(?:amp;)?cnum=(\d+)['"]?""",
+    re.IGNORECASE,
+)
+
+
+def _parse_deed_list(html: str) -> list[DeedRecord]:
+    """Parse dlist.php HTML into DeedRecord rows.
+
+    Each record on the dlist page is rendered as its own ``<table border=3>``
+    with a single TR of 9 cells:
+        [0] Image?  [1] Details  [2] Grantor/Debtor  [3] Grantee/Secured Party
+        [4] Legal Desc  [5] Date  [6] Book Info / FileNum  [7] Document Type
+        [8] XRef
+    The first such table is the column header; skip it.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        logger.warning("JCD: bs4 not available — dlist parsing skipped")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    records: list[DeedRecord] = []
+
+    for table in soup.find_all("table", border="3"):
+        tr = table.find("tr")
+        if not tr:
+            continue
+        cells = tr.find_all("td", recursive=False)
+        if len(cells) < 9:
+            continue
+
+        def cell_text(td) -> str:
+            return re.sub(r"\s+", " ", td.get_text(" ", strip=True)).strip()
+
+        # Skip the header row (contains literal 'Grantor/Debtor' text)
+        c0, c1, c2 = cell_text(cells[0]), cell_text(cells[1]), cell_text(cells[2])
+        if c0 == "Image?" or c2 == "Grantor/Debtor":
+            continue
+
+        # Details cell contains the pdetail.php anchor
+        details_a = cells[1].find("a", href=re.compile(r"pdetail\.php"))
+        if not details_a:
+            continue
+        href = details_a.get("href", "")
+        m = re.search(
+            r"instnum=(\d+)&(?:amp;)?year=(\d+)&(?:amp;)?db=(\d*)&(?:amp;)?cnum=(\d+)",
+            href,
+        )
+        if not m:
+            continue
+        instnum, year, db, cnum = m.group(1), m.group(2), m.group(3) or "", m.group(4)
+
+        # Image cell — viewimg.php?img=...&type=pdf
+        view_img = ""
+        img_a = cells[0].find("a", href=re.compile(r"viewimg\.php"))
+        if img_a:
+            img_m = re.search(r"img=([A-Za-z0-9+/=]+)", img_a.get("href", ""))
+            if img_m:
+                view_img = img_m.group(1)
+
+        grantor = cell_text(cells[2])
+        grantee = cell_text(cells[3])
+        legal_desc = cell_text(cells[4])
+        date_raw = cell_text(cells[5])
+        filed_date = _normalize_date(date_raw) if re.match(r"\d{2}/\d{2}/\d{4}", date_raw) else ""
+        book_page = cell_text(cells[6])
+        doc_type = cell_text(cells[7])
+
+        # XRef cell — holds cross-referenced instrument numbers, often as a
+        # nested table of (Inst#, Inst Desc, Year, XRef Book, XRef Page).
+        xref_text = cell_text(cells[8])
+        xrefs = re.findall(r"\b(\d{9,14})\b", xref_text)
+
+        detail_url = f"{JCD_DETAIL_URL}?instnum={instnum}&year={year}&db={db}&cnum={cnum}"
+        records.append(DeedRecord(
+            instnum=instnum,
+            year=year,
+            db=db,
+            filed_date=filed_date,
+            book_page=book_page,
+            doc_type=doc_type,
+            grantor=grantor,
+            grantee=grantee,
+            legal_desc=legal_desc,
+            detail_url=detail_url,
+            view_img=view_img,
+            xrefs=list(dict.fromkeys(xrefs)),
+        ))
+    return records
+
+
+def _fetch_pdetail(
+    opener: urllib.request.OpenerDirector, detail_url: str,
+) -> dict[str, str]:
+    """GET a pdetail.php page and extract labelled fields.
+
+    Returns dict with keys: 'mort_amount', 'tax_amount', 'trans_amount',
+    'doc_type', 'file_date', 'book', 'page', 'instrument_date'.
+    """
+    _delay()
+    try:
+        req = urllib.request.Request(detail_url, headers={
+            "User-Agent": _USER_AGENT,
+            "Referer": JCD_DLIST_URL,
+        })
+        with opener.open(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.debug("JCD pdetail fetch failed: %s", exc)
+        return {}
+
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    def grab(pattern: str) -> str:
+        m = re.search(pattern, text, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    return {
+        "mort_amount": grab(r"Mort\s*\$\s*([\d,.]+)"),
+        "tax_amount":  grab(r"Tax\s*\$\s*([\d,.]+)"),
+        "trans_amount": grab(r"Trans\s*\$\s*([\d,.]+)"),
+        "doc_type":    grab(r"Doc\s+Type[:\s]+([A-Z][A-Z &/]+)"),
+        "file_date":   grab(r"File\s+Date[:\s]+(\d{2}/\d{2}/\d{4})"),
+        "book":        grab(r"Book\s*#\s*(\d+)"),
+        "page":        grab(r"Page\s*#\s*(\d+)"),
+        "instrument_date": grab(r"Instrument\s+Date[:\s]+(\d{2}/\d{2}/\d{4})"),
+    }
+
+
+# Doc-type classification
+_MORTGAGE_TYPES = {"MORTGAGE", "MTG", "FIXTURE FILING", "ASSG OF MTG", "ASGN OF MTG"}
+_RELEASE_TYPES = {"REL MTG", "RELEASE OF MORTGAGE", "MTG RELEASE", "REL OF MTG"}
+_DEED_TYPES = {"DEED", "WARRANTY DEED", "QUIT CLAIM", "GRANT DEED"}
+
+
+def _classify(doc_type: str) -> str:
+    """Group a JCD document type string into a coarse category.
+
+    JCD stores types in short abbreviations: "MTG ELEC REGIST" (mortgage with
+    MERS), "REL MTG" or bare "RELEASE" (satisfaction of mortgage), plain
+    "DEED", etc. The 6-char abbreviations in the Instrument Type dropdown
+    are aliases for the same stored values.
+    """
+    up = doc_type.upper().strip()
+    if not up:
+        return "other"
+    release_hints = (
+        "REL MTG", "RELEASE OF MORTGAGE", "REL OF MTG", "MTG RELEASE",
+        "RELEASE",  # catch-all; JCD also uses bare "RELEASE" for mortgage releases
+        "REL ",     # "REL STATE LIEN", "REL FIX", etc.
+        "SATISFACTION",
+    )
+    if any(t in up for t in release_hints):
+        return "release"
+    if "MORTGAGE" in up or re.search(r"\bMTG\b", up):
+        return "mortgage"
+    if "DEED" in up:
+        return "deed"
+    if "LIEN" in up:
+        return "lien"
+    return "other"
+
+
+def _parse_money(raw: str) -> int:
+    """'$123,456.78' or '123,456' → int dollars (truncated). 0 on failure."""
+    if not raw:
+        return 0
+    cleaned = re.sub(r"[^\d.]", "", raw)
+    if not cleaned:
+        return 0
+    try:
+        return int(float(cleaned))
+    except ValueError:
+        return 0
+
+
+def _amortized_balance(
+    original_amount: int, origination_date: str,
+    term_years: int = _MORTGAGE_TERM_YEARS, annual_rate: float = _MORTGAGE_RATE,
+    as_of: datetime | None = None,
+) -> int:
+    """Remaining principal on a fully-amortizing fixed-rate mortgage.
+
+    Formula: B(t) = P * (((1+r)^n - (1+r)^t) / ((1+r)^n - 1))
+    where r = monthly rate, n = total months, t = months elapsed.
+    """
+    if original_amount <= 0 or not origination_date:
+        return 0
+    try:
+        origin = datetime.strptime(origination_date, "%Y-%m-%d")
+    except ValueError:
+        return 0
+    now = as_of or datetime.now()
+    months_elapsed = max(0, (now.year - origin.year) * 12 + (now.month - origin.month))
+    n = term_years * 12
+    if months_elapsed >= n:
+        return 0
+    r = annual_rate / 12.0
+    if r == 0:
+        return max(0, original_amount - int(original_amount * months_elapsed / n))
+    factor_n = (1 + r) ** n
+    factor_t = (1 + r) ** months_elapsed
+    remaining = original_amount * (factor_n - factor_t) / (factor_n - 1)
+    return int(max(0, remaining))
+
+
+# Number of months back to consider a deed transfer "recent" for heir-
+# property detection. Probate properties that have been transferred to
+# heirs in this window are still fresh REI opportunities (the new heir
+# often wants to sell inherited property quickly).
+_HEIR_TRANSFER_LOOKBACK_MONTHS = 24
+
+
+def _surname(name: str) -> str:
+    """Extract a best-guess surname for a name string. Returns upper-case.
+
+    Three input formats seen in practice:
+      * 'SMITH, DOLLY'         — comma format (KCOJ decedents). Surname first.
+      * 'SMITH JANE'           — all-caps LAST FIRST (JCD deed grantors/grantees).
+                                  Surname first.
+      * 'Jane Smith'           — natural order. Surname last.
+    The heuristic: comma first, else all-caps → surname-first, else surname-last.
+    """
+    if "," in name:
+        return name.split(",", 1)[0].strip().upper()
+    tokens = [t for t in re.split(r"\s+", name.strip()) if t]
+    if not tokens:
+        return ""
+    # JCD deed records are uniformly upper-case with LAST FIRST token order.
+    # If the full string is upper-case alpha, treat first token as surname.
+    letters_only = re.sub(r"[^A-Za-z]", "", name)
+    if letters_only and letters_only.isupper():
+        return tokens[0].upper()
+    return tokens[-1].upper()
+
+
+# Patterns that indicate a non-individual title holder (trust, LLC, estate).
+# Used by _find_current_holder to tag the holder relationship.
+_TRUST_RE = re.compile(r"\bTRUST\b|\bTRUSTEE\b|\bLIVING\s+TRUST\b", re.IGNORECASE)
+_ENTITY_RE = re.compile(r"\b(?:LLC|INC|CORP|CO\.?|LP|LTD|FOUNDATION)\b", re.IGNORECASE)
+_ESTATE_OF_RE = re.compile(r"\bESTATE\s+OF\b", re.IGNORECASE)
+
+
+def _clean_holder_name(raw: str) -> str:
+    """Tidy a deed grantee string for use as a downstream search target.
+
+    JCD often emits doubled phrases like 'ROBERT G REAGAN TRUST REAGAN ROBERT G TRUST'
+    where the trust appears twice (one form per side of the conveyance). Detect
+    that pattern by splitting on whitespace and finding a repeated TRUST token,
+    then return only the first half.
+    """
+    s = re.sub(r"\s+", " ", raw).strip()
+    # Detect a repeated phrase: split into tokens, find if the first half == second half
+    tokens = s.split()
+    if len(tokens) >= 4 and len(tokens) % 2 == 0:
+        half = len(tokens) // 2
+        if tokens[:half] == tokens[half:]:
+            s = " ".join(tokens[:half])
+    # Detect "X TRUST Y TRUST" duplication where X and Y are reorderings of the same name
+    m = re.match(r"^(.+?\bTRUST\b)\s+(.+?\bTRUST\b)$", s, re.IGNORECASE)
+    if m:
+        first, second = m.group(1).strip(), m.group(2).strip()
+        # If the two halves share the same canonical token set, keep only one
+        first_tokens = set(re.findall(r"\b[A-Za-z]+\b", first.upper()))
+        second_tokens = set(re.findall(r"\b[A-Za-z]+\b", second.upper()))
+        if first_tokens == second_tokens and first_tokens:
+            s = first  # Either half is fine; first is the natural order
+    return s
+
+
+# Maximum age (months) for a "decedent-as-grantor" deed to be considered
+# a recent post-death transfer. Older grantor-out deeds are pre-death sales
+# (decedent didn't own at time of death) and should NOT trigger heir lookup.
+# 36 months = 3 years; covers cases where probate filed up to ~2 years
+# after death, plus a buffer for the deed-recording lag.
+_RECENT_TRANSFER_MAX_AGE_MONTHS = 36
+
+
+def _find_current_holder(
+    records: list[DeedRecord],
+    decedent_name: str,
+    as_of: datetime | None = None,
+) -> tuple[str, str, str] | None:
+    """Walk the deed chain to identify who currently holds title.
+
+    Strategy: among all records classified as 'deed' (transfers of title)
+    where the decedent appears as either grantor or grantee, find the
+    MOST RECENT one. The current title holder is:
+      * the GRANTEE of that deed (if recent-enough transfer FROM decedent
+        or their estate to a trust / heir / buyer)
+      * the decedent themselves (if most recent deed has them as grantee —
+        i.e., they received title and never transferred out)
+
+    Date guardrail: if the most recent grantor-out deed is older than
+    ``_RECENT_TRANSFER_MAX_AGE_MONTHS``, return None — the decedent gave
+    up title long before death and the grantee is an unrelated buyer, not
+    an heir/trust.
+
+    Returns (holder_name, relationship, deed_date) or None. ``relationship``
+    is one of:
+      * "self"        — decedent is the most recent grantee, still holds title
+      * "trust"       — title transferred to a trust the decedent created
+      * "heir_recent" — title transferred to an individual heir (probably family)
+    """
+    if not decedent_name.strip():
+        return None
+    dec_surname = _surname(decedent_name)
+    if not dec_surname:
+        return None
+
+    # Filter to actual deeds (skip mortgages, liens, releases) where the
+    # decedent's surname appears in either grantor or grantee.
+    candidates: list[DeedRecord] = []
+    for rec in records:
+        if _classify(rec.doc_type) != "deed":
+            continue
+        if not rec.filed_date:
+            continue
+        grantor_u = rec.grantor.upper()
+        grantee_u = rec.grantee.upper()
+        if dec_surname in grantor_u or dec_surname in grantee_u:
+            candidates.append(rec)
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: r.filed_date, reverse=True)
+    most_recent = candidates[0]
+
+    grantor_u = most_recent.grantor.upper()
+    grantee_u = most_recent.grantee.upper()
+    decedent_was_grantor = dec_surname in grantor_u
+    decedent_was_grantee = dec_surname in grantee_u
+
+    if decedent_was_grantee and not decedent_was_grantor:
+        # Decedent received title and didn't transfer it out — they still hold.
+        return (decedent_name, "self", most_recent.filed_date)
+
+    # Decedent (or their estate) gave up title. Apply date guardrail:
+    # transfers older than the cutoff were pre-death sales, not heir
+    # transfers. The grantee is an unrelated buyer; decedent didn't
+    # own at time of death.
+    now = as_of or datetime.now()
+    cutoff = now - timedelta(days=_RECENT_TRANSFER_MAX_AGE_MONTHS * 31)
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+    if most_recent.filed_date < cutoff_str:
+        # Old sale — decedent has no current property here.
+        return None
+
+    holder = _clean_holder_name(most_recent.grantee)
+    if not holder:
+        return None
+
+    if _TRUST_RE.search(holder) or _ENTITY_RE.search(holder):
+        relationship = "trust"
+    else:
+        relationship = "heir_recent"
+    return (holder, relationship, most_recent.filed_date)
+
+
+def _find_recent_transfer(
+    records: list[DeedRecord], decedent_name: str,
+    lookback_months: int = _HEIR_TRANSFER_LOOKBACK_MONTHS,
+    as_of: datetime | None = None,
+) -> DeedRecord | None:
+    """Find a deed where the decedent transferred property within the window.
+
+    Looks for records classified as 'deed' where the grantor contains the
+    decedent's name (substring, case-insensitive). Returns the most recent
+    such record within ``lookback_months``, or None.
+
+    Note: we look at GRANTOR — the party giving up ownership — because in a
+    post-death transfer the decedent (or "ESTATE OF <decedent>") is the
+    grantor and the heir is the grantee.
+    """
+    if not decedent_name.strip():
+        return None
+    now = as_of or datetime.now()
+    cutoff = now.replace(day=1) - timedelta(days=lookback_months * 31)
+    cutoff_str = cutoff.strftime("%Y-%m-%d")
+
+    dec_surname = _surname(decedent_name)
+    if not dec_surname:
+        return None
+
+    candidates: list[DeedRecord] = []
+    for rec in records:
+        if _classify(rec.doc_type) != "deed":
+            continue
+        if not rec.filed_date or rec.filed_date < cutoff_str:
+            continue
+        grantor_upper = rec.grantor.upper()
+        # Must mention the decedent's surname. ESTATE OF transfers typically
+        # have grantor strings like "ESTATE OF SMITH DOLLY" or just
+        # "SMITH DOLLY" (pre-probate transfer).
+        if dec_surname in grantor_upper:
+            candidates.append(rec)
+
+    if not candidates:
+        return None
+    # Most recent wins
+    candidates.sort(key=lambda r: r.filed_date, reverse=True)
+    return candidates[0]
+
+
+def _choose_active_mortgage(
+    records: list[DeedRecord],
+) -> DeedRecord | None:
+    """Return the most recent mortgage that hasn't been released.
+
+    Two release-detection signals:
+      1. A RELEASE record in ``records`` whose xref list contains the
+         mortgage's instnum (explicit release within the same owner's
+         deed history).
+      2. The mortgage's own xref list contains an instnum that looks
+         YYYY-prefixed and later than the mortgage's own filed year
+         (implicit release: releases are typically filed by the lender
+         so they won't appear under the decedent's name, but the
+         mortgage record is updated to cross-reference the release).
+    """
+    mortgages = [r for r in records if _classify(r.doc_type) == "mortgage"]
+    releases = [r for r in records if _classify(r.doc_type) == "release"]
+
+    # Signal 1: explicit release records
+    released_instnums: set[str] = set()
+    for rel in releases:
+        released_instnums.update(rel.xrefs)
+
+    def is_released(m: DeedRecord) -> bool:
+        if m.instnum in released_instnums:
+            return True
+        # Signal 2: the mortgage's own xrefs include a later YYYY* instnum.
+        # JCD instrument numbers start with the 4-digit year (e.g. 2017214642).
+        mortgage_year = int(m.year) if m.year.isdigit() else 0
+        for xref in m.xrefs:
+            if len(xref) >= 4 and xref[:4].isdigit():
+                xref_year = int(xref[:4])
+                if xref_year > mortgage_year:
+                    return True
+        return False
+
+    active = [m for m in mortgages if not is_released(m)]
+    if not active:
+        return None
+    active.sort(key=lambda r: r.filed_date, reverse=True)
+    return active[0]
+
+
+def lookup_owner_deed_history(
+    notice: NoticeData,
+    opener: urllib.request.OpenerDirector | None = None,
+) -> None:
+    """Populate mortgage_* fields on ``notice`` from JCD deed history.
+
+    Uses ``notice.decedent_name`` (for probate) or ``notice.owner_name``
+    (otherwise). Runs the 2-step p3.php → dlist.php flow, picks the
+    best-matching owner row, classifies deeds, and estimates remaining
+    mortgage balance via straight-line amortization of the most recent
+    unreleased mortgage.
+    """
+    query = notice.decedent_name.strip() or notice.owner_name.strip()
+    if not query:
+        return
+
+    # Normalize KCOJ-style "LAST, FIRST MIDDLE" to "LAST FIRST MIDDLE" and
+    # strip suffixes. JCD owner search wants space-separated tokens.
+    query = _SUFFIX_DEED_RE.sub("", query).strip()
+    query = query.replace(",", " ")
+    query = re.sub(r"\s+", " ", query).strip()
+
+    own = opener is None
+    if own:
+        opener = _make_opener()
+        _accept_disclaimer(opener)
+
+    try:
+        rows = _search_names_unique(opener, query)
+        best = _pick_best_name_match(query, rows)
+        if not best:
+            logger.info("JCD: no deed-list match for %r (checked %d rows)", query, len(rows))
+            return
+        display, checkbox_value, count = best
+        logger.info("JCD: matched %r → %r (%d records)", query, display, count)
+
+        html = _fetch_deed_list(opener, checkbox_value)
+        if not html:
+            return
+
+        records = _parse_deed_list(html)
+        logger.debug("JCD: parsed %d deed records for %r", len(records), display)
+
+        # Current-title-holder detection: walk the deed chain to identify
+        # who currently holds title to the decedent's property. This is
+        # the primary search target for the downstream PVA lookup —
+        # bypasses the "PVA-by-decedent-name" miss rate that plagued
+        # earlier runs (trust-held, estate-titled, joint-with-spouse cases
+        # all resolve through here).
+        holder = _find_current_holder(records, notice.decedent_name or display)
+        if holder:
+            holder_name, relationship, holder_date = holder
+            notice.current_property_holder = holder_name
+            notice.current_holder_relationship = relationship
+            logger.info(
+                "JCD: current holder for %r -> %r (%s, deed %s)",
+                display, holder_name, relationship, holder_date,
+            )
+
+        # Extract parcel ID directly from deed legal descriptions. Many
+        # JCD records include the 12-char Jefferson PIDN embedded in the
+        # legal_desc text (e.g. "4-6-16 23088900270000 ACME WAY") — no OCR
+        # needed, much more reliable than the mortgage-PDF extraction.
+        # Take the PIDN from the most recent deed where decedent is a party.
+        if not notice.deed_discovered_parcel_id.strip():
+            dec_surname = _surname(notice.decedent_name or display)
+            for rec in sorted(records, key=lambda r: r.filed_date, reverse=True):
+                if _classify(rec.doc_type) not in ("deed", "mortgage"):
+                    continue
+                if dec_surname and (dec_surname not in rec.grantor.upper()
+                                    and dec_surname not in rec.grantee.upper()):
+                    continue
+                pid_m = re.search(r"\b(\d{3}[A-Z]?\d{7,9})\b", rec.legal_desc)
+                if pid_m and len(re.sub(r"\D", "", pid_m.group(1))) >= 11:
+                    notice.deed_discovered_parcel_id = pid_m.group(1)
+                    logger.info(
+                        "JCD: parcel id from deed legal_desc: %s (deed %s)",
+                        pid_m.group(1), rec.filed_date,
+                    )
+                    break
+
+        # Heir-transfer detection (within 24 months): retains its original
+        # purpose of flagging recent family transfers as a same-surname
+        # signal. Phase 2a will use ``current_property_holder`` for the
+        # actual PVA search; this is supplementary metadata.
+        transfer = _find_recent_transfer(records, notice.decedent_name or display)
+        if transfer and transfer.grantee:
+            notice.heir_transferred_to = transfer.grantee
+            notice.heir_transfer_date = transfer.filed_date
+            dec_surname = _surname(notice.decedent_name or display)
+            grantee_surname = _surname(transfer.grantee)
+            if dec_surname and dec_surname == grantee_surname:
+                notice.heir_same_surname = "yes"
+            logger.info(
+                "JCD: recent transfer found for %r: grantor=%r -> grantee=%r on %s%s",
+                display, transfer.grantor, transfer.grantee, transfer.filed_date,
+                " (same-surname)" if notice.heir_same_surname == "yes" else "",
+            )
+
+        active_mtg = _choose_active_mortgage(records)
+        if not active_mtg:
+            # Distinguish "found mortgages but all released" (real $0 signal)
+            # from "no mortgage records at all" (unknown, leave empty so the
+            # equity estimator falls back to 85%-of-assessed).
+            mortgage_count = sum(1 for r in records if _classify(r.doc_type) == "mortgage")
+            if mortgage_count > 0:
+                logger.info(
+                    "JCD: %r had %d mortgage(s) — all released, setting balance=0",
+                    display, mortgage_count,
+                )
+                notice.mortgage_balance_estimate = "0"
+                notice.mortgage_origination_date = ""
+                notice.mortgage_original_amount = "0"
+            else:
+                logger.info("JCD: no mortgage records at all for %r", display)
+            return
+
+        # Fetch dollar amount from the pdetail page
+        detail = _fetch_pdetail(opener, active_mtg.detail_url)
+        original = _parse_money(detail.get("mort_amount", ""))
+        if original <= 0:
+            logger.info(
+                "JCD: active mortgage %s has no dollar amount (doc_type=%r)",
+                active_mtg.instnum, active_mtg.doc_type,
+            )
+            return
+
+        balance = _amortized_balance(original, active_mtg.filed_date)
+        notice.mortgage_original_amount = str(original)
+        notice.mortgage_origination_date = active_mtg.filed_date
+        notice.mortgage_balance_estimate = str(balance)
+        logger.info(
+            "JCD: %r mortgage $%s (%s) → estimated balance $%s",
+            display, f"{original:,}", active_mtg.filed_date, f"{balance:,}",
+        )
+
+        # OCR the active mortgage PDF to extract the property's street
+        # address and parcel ID. PVA owner-search frequently misses the
+        # decedent (married-name records, middle-initial variants, etc.);
+        # the address is a more reliable second-tier lookup key. Cheap
+        # because we only OCR when there's an active mortgage to begin with.
+        if active_mtg.view_img and not notice.deed_discovered_address.strip():
+            try:
+                addr, city, zipc, parcel_id, src = _fetch_address_from_document(
+                    active_mtg.view_img,
+                )
+                if addr:
+                    notice.deed_discovered_address = addr
+                    logger.info(
+                        "JCD: OCR'd address from mortgage %s: %r (source=%s)",
+                        active_mtg.instnum, addr, src,
+                    )
+                if parcel_id:
+                    notice.deed_discovered_parcel_id = parcel_id
+                    logger.info(
+                        "JCD: OCR'd parcel id from mortgage %s: %s",
+                        active_mtg.instnum, parcel_id,
+                    )
+            except Exception as exc:
+                logger.debug("JCD: OCR for mortgage %s failed: %s",
+                             active_mtg.instnum, exc)
+    finally:
+        pass  # opener has no explicit close; cookies expire with process
+
+
+def enrich_mortgage_balances(notices: list[NoticeData]) -> None:
+    """Phase 2b entry point: populate mortgage_* fields on Jefferson records.
+
+    Target set: Jefferson County records where we have *something* to search
+    by — decedent_name (probate) or owner_name. Records whose PVA lookup
+    already populated a street address are prioritized since a confirmed
+    property adds signal, but we don't gate on it: a match against the deed
+    history still tells us whether the decedent had an active mortgage.
+    """
+    candidates = [
+        n for n in notices
+        if n.county.lower() == "jefferson"
+        and (n.decedent_name.strip() or n.owner_name.strip())
+        and not n.mortgage_balance_estimate.strip()
+    ]
+    if not candidates:
+        return
+
+    logger.info("JCD: Phase 2b deed lookup for %d Jefferson record(s)", len(candidates))
+    opener = _make_opener()
+    _accept_disclaimer(opener)
+
+    for notice in candidates:
+        try:
+            lookup_owner_deed_history(notice, opener=opener)
+        except Exception as exc:
+            logger.warning(
+                "JCD: deed lookup failed for %r: %s",
+                notice.decedent_name or notice.owner_name, exc,
+            )

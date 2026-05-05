@@ -8,8 +8,8 @@ tables until no new rows appear. Never truncate or stop at visible rows.
 
 Usage:
     python src/extract_market_finder.py --state "Tennessee" --county "Knox"
-    python src/extract_market_finder.py --state "Tennessee" --county "Knox" --headless
-    python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount"
+    python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount" --headless
+    python src/extract_market_finder.py --state "Kentucky"  --county "Jefferson"
 
 Output: JSON file(s) in --output-dir with extracted market data.
 
@@ -829,7 +829,7 @@ def main():
     parser.add_argument(
         "--county",
         required=True,
-        help="County name(s), comma-separated (e.g., Knox or Knox,Blount)",
+        help="County name(s), comma-separated (e.g., Knox or Knox,Blount; or Jefferson for KY)",
     )
     parser.add_argument(
         "--headless",

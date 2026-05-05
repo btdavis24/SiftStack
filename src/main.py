@@ -2,7 +2,11 @@
 
 Runs as either:
   - Apify Actor (when APIFY_IS_AT_HOME is set — reads input from Actor.get_input())
-  - Standalone CLI (python src/main.py daily --counties Knox --types foreclosure)
+  - Standalone CLI (e.g. ``python src/main.py daily --counties Knox,Jefferson``)
+
+Supports both target markets:
+  - TN: Knox, Blount counties (Knoxville/Maryville metro)
+  - KY: Jefferson county (Louisville metro)
 """
 
 import argparse
@@ -1017,7 +1021,8 @@ def _run_manage_sold(args) -> None:
     """Run the SiftMap sold properties management workflow."""
     from datasift_uploader import run_manage_sold_workflow
 
-    # Parse counties if provided, otherwise use default (Knox, Blount)
+    # Parse counties if provided, otherwise the workflow uses its built-in
+    # default (Knox + Blount + Jefferson).
     counties = None
     if args.counties and args.counties.lower() != "all":
         counties = [c.strip().title() for c in args.counties.split(",")]
@@ -1068,7 +1073,8 @@ def cli_main() -> None:
         "--counties",
         type=str,
         default=None,
-        help='Comma-separated counties to scrape (e.g. "Knox,Blount" or "all")',
+        help='Comma-separated counties to scrape (e.g. "Knox,Blount,Jefferson" or "all"). '
+             'TN: Knox, Blount. KY: Jefferson.',
     )
     parser.add_argument(
         "--types",
@@ -1395,12 +1401,35 @@ def cli_main() -> None:
                         help="Property address (comp/rehab/analyze-deal modes)")
     parser.add_argument("--city", type=str, default=None,
                         help="Property city (comp/rehab/analyze-deal modes)")
+    parser.add_argument("--state", type=str, default=None,
+                        help="Property state, 2-letter (comp/rehab/analyze-deal modes, default: TN)")
     parser.add_argument("--zip-code", type=str, default=None,
                         help="Property ZIP code (comp/rehab/analyze-deal modes)")
     parser.add_argument("--radius", type=float, default=0.5,
                         help="Comp search radius in miles (comp mode, default: 0.5)")
     parser.add_argument("--months", type=int, default=6,
                         help="Comp lookback months (comp mode, default: 6)")
+    # Subject overrides for comp mode — use when Zillow's reso facts are stale
+    parser.add_argument("--subject-beds", type=int, default=None,
+                        help="Override Zillow's bedroom count for subject (comp mode)")
+    parser.add_argument("--subject-baths", type=float, default=None,
+                        help="Override Zillow's bathroom count for subject (comp mode)")
+    parser.add_argument("--subject-sqft", type=int, default=None,
+                        help="Override Zillow's total sqft for subject (comp mode)")
+    parser.add_argument("--subject-ag", type=int, default=None,
+                        help="Subject above-grade sqft (comp mode) — needed if different from total")
+    parser.add_argument("--subject-bg", type=int, default=None,
+                        help="Subject below-grade finished sqft (comp mode) — often missing from Zillow")
+    parser.add_argument("--subject-year", type=int, default=None,
+                        help="Override Zillow's year built for subject (comp mode)")
+    parser.add_argument("--subject-lot", type=int, default=None,
+                        help="Override Zillow's lot sqft for subject (comp mode)")
+    parser.add_argument("--subject-garage", type=int, default=None,
+                        help="Override Zillow's garage stall count for subject (comp mode)")
+    parser.add_argument("--target-condition", type=str, default="full",
+                        help="Subject's target post-rehab condition — as-is/light/full (comp mode)")
+    parser.add_argument("--condition-file", type=str, default="data/condition_overrides.csv",
+                        help="CSV of zpid/address → condition labels (comp mode)")
 
     # Rehab estimation
     parser.add_argument("--tier", type=int, default=2, choices=[1, 2, 3, 4],
@@ -1487,7 +1516,22 @@ def cli_main() -> None:
     # ── Preflight health checks ──────────────────────────────────────
     _counties = [c.strip() for c in args.counties.split(",")] if args.counties else None
     _types = [t.strip() for t in args.types.split(",")] if getattr(args, "types", None) else None
-    preflight_failures = _preflight_check(args.mode, active_searches=_filter_searches(_counties, _types))
+    _active_searches = _filter_searches(_counties, _types)
+
+    # Auto-enable Slack notification whenever the resolved run includes the
+    # lis pendens scrape so the JCD scrape always pings on completion without
+    # the operator having to remember --notify-slack. Covers explicit
+    # --types lis_pendens, unfiltered runs, and --counties-only filters.
+    # Both the empty-results and full-results paths at the bottom of
+    # run_pipeline gate on args.notify_slack.
+    if (
+        any(s.notice_type == "lis_pendens" for s in _active_searches)
+        and not getattr(args, "notify_slack", False)
+    ):
+        args.notify_slack = True
+        logging.info("Auto-enabled Slack notification for lis_pendens run")
+
+    preflight_failures = _preflight_check(args.mode, active_searches=_active_searches)
     if preflight_failures:
         for f in preflight_failures:
             logging.error("Preflight FAILED: %s", f)
@@ -1507,16 +1551,32 @@ def cli_main() -> None:
             print("ERROR: --address is required for comp mode")
             return
         from comp_analyzer import run_comp_analysis
+        overrides = {}
+        if args.subject_beds is not None: overrides["beds"] = args.subject_beds
+        if args.subject_baths is not None: overrides["baths"] = args.subject_baths
+        if args.subject_sqft is not None: overrides["sqft"] = args.subject_sqft
+        if args.subject_ag is not None: overrides["ag_sqft"] = args.subject_ag
+        if args.subject_bg is not None: overrides["bg_sqft"] = args.subject_bg
+        if args.subject_year is not None: overrides["year_built"] = args.subject_year
+        if args.subject_lot is not None: overrides["lot_sqft"] = args.subject_lot
+        if args.subject_garage is not None: overrides["garage"] = args.subject_garage
         result = run_comp_analysis(
-            address=args.address, city=args.city or "", zip_code=args.zip_code or "",
-            radius=args.radius, months=args.months,
+            address=args.address, city=args.city or "", state=args.state or "TN",
+            zip_code=args.zip_code or "", radius=args.radius, months=args.months,
+            subject_overrides=overrides or None,
+            target_condition=args.target_condition,
+            condition_file=args.condition_file,
         )
         if "error" in result:
             logger.error("Comp analysis failed: %s", result["error"])
         else:
-            print(f"Comp report: {result['report_path']}")
+            print(f"Comp report (Excel): {result['report_path']}")
+            if result.get("pdf_path"):
+                print(f"Comp report (PDF):   {result['pdf_path']}")
             arv = result["arv"]
             print(f"ARV: ${arv.arv_low:,.0f} (low) / ${arv.arv_mid:,.0f} (mid) / ${arv.arv_high:,.0f} (high)")
+            if arv.sentiment_adj_pct:
+                print(f"Market phase: {arv.market_phase} (DOM {arv.market_dom_avg}d) → {arv.sentiment_adj_pct:+.0%} sentiment adj")
             print(f"Confidence: {arv.confidence} — {arv.confidence_reason}")
         return
 
