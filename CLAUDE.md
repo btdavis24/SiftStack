@@ -397,7 +397,7 @@ The visual format was iterated and approved as "the standard". Future tweaks sho
 
 - **Header band**: logo (left, 110×55) · "Rednour Real Estate Services" + "Investment Opportunity — Off-Market" tagline (center) · "CALL DIRECT" + phone in red (right) · 2pt red `LINEBELOW`
 - **Hero photo**: 2.9" tall, full width, proportional fit (single hero — no second photo)
-- **Address line**: 18pt bold, centered, format `"1521 SALE AVE · LOUISVILLE, KY 40215"`
+- **Location line**: 18pt bold, centered. **City, state, zip ONLY — no street address.** Format `"LOUISVILLE, KY 40215"`. Withholding the street is intentional: buyers must call to get the exact location, which gates the flyer behind a phone touch and filters out tire-kickers. Do not change without explicit permission.
 - **Stats strip**: 4 light-bg boxes — Beds | Baths | Sqft (with `BUILT YYYY` + `+NNN BSMT` sub-label) | Acreage
 - **Money row**: ASKING PRICE | ARV (label is exactly "ARV", no parenthetical) — both red boxes pinned to identical row heights `[14, 38]` so different fonts (auto-shrink for long strings) don't make one taller than the other
 - **Info row**: Additional Info card (red header strip + bullets, light body) | dark "VIEW ALL PHOTOS →" button — both 1.5" tall

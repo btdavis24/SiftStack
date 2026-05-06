@@ -669,13 +669,15 @@ def build_pdf(data: FlyerData, output_path: Path) -> Path:
         flow.append(ph)
     flow.append(Spacer(1, 8))
 
-    # ── Address line ─────────────────────────────────────────────────
+    # ── Location line ────────────────────────────────────────────────
+    # Deliberately city/state/zip only — no street address. Buyers must
+    # call to get the exact location, which gates the flyer behind a
+    # phone touch and filters out tire-kickers.
     addr_s = ParagraphStyle(
         "Addr", fontName="Helvetica-Bold", fontSize=18, textColor=DARK,
         alignment=TA_CENTER, leading=22,
     )
     addr_text = (
-        f"{data.address.upper()} &middot; "
         f"{data.city.upper()}, {data.state.upper()} {data.zip_code}"
     )
     flow.append(Paragraph(addr_text, addr_s))
