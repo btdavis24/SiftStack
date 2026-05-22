@@ -40,6 +40,7 @@ from bs4 import BeautifulSoup
 
 import config
 from config import REQUEST_DELAY_MAX, REQUEST_DELAY_MIN
+from kentucky_name_resolver import score_match, _search_variations
 
 if TYPE_CHECKING:
     from notice_parser import NoticeData
@@ -493,110 +494,8 @@ def get_detail(session: requests.Session, lrsn: str) -> dict[str, str]:
 
 
 # ── Name matching / scoring ───────────────────────────────────────────
-
-_SUFFIX_RE = re.compile(r"\b(JR|SR|II|III|IV|ESQ)\b\.?", re.IGNORECASE)
-
-
-def _name_tokens(name: str) -> list[str]:
-    """Normalize a name to a list of uppercase alphabetical tokens."""
-    cleaned = _SUFFIX_RE.sub("", name).upper()
-    cleaned = re.sub(r"[^A-Z\s]", " ", cleaned)
-    return [t for t in cleaned.split() if len(t) > 1]
-
-
-def _search_variations(name: str) -> list[str]:
-    """Generate PVA search variations for a decedent name.
-
-    KCOJ decedent names come in multiple formats:
-      * "ROLAND, WELDON GENE"     — LAST, FIRST MIDDLE (court format)
-      * "WELDON GENE ROLAND"      — FIRST MIDDLE LAST  (natural format)
-      * "EWING, WELDON GENE JR"   — with suffix
-
-    PVA owner-search is substring match. Return variations in priority order:
-      1. Plain LAST FIRST — matches when decedent is current owner directly
-      2. LAST FIRST MIDDLE — same, with middle name/initial
-      3. ESTATE OF LAST FIRST — matches when PVA has retitled the property
-         to the estate (common after probate is opened; the property is
-         still controlled by the estate until distributed to heirs)
-    """
-    tokens = _name_tokens(name)
-    if not tokens:
-        return []
-
-    variations: list[str] = []
-    last = ""
-    first_parts: list[str] = []
-
-    comma_match = re.match(r"\s*([^,]+),\s*(.+)", name)
-    if comma_match:
-        last = " ".join(_name_tokens(comma_match.group(1)))
-        first_parts = _name_tokens(comma_match.group(2))
-    elif len(tokens) >= 2:
-        # Natural order "FIRST MIDDLE LAST" — assume last token is surname
-        last = tokens[-1]
-        first_parts = tokens[:-1]
-
-    if last and first_parts:
-        # Direct-ownership variations
-        variations.append(f"{last} {first_parts[0]}")            # LAST first
-        if len(first_parts) > 1:
-            variations.append(f"{last} {' '.join(first_parts)}")  # LAST first middle
-
-        # Estate-titled variations. PVA stores these verbatim, e.g.
-        # "ESTATE OF SMITH DOLLY" — common format for properties where
-        # probate has been opened and title re-issued to the estate.
-        variations.append(f"ESTATE OF {last} {first_parts[0]}")
-        if len(first_parts) > 1:
-            variations.append(f"ESTATE OF {last} {' '.join(first_parts)}")
-
-    # Dedup preserving order, filter empties
-    return list(dict.fromkeys(v.strip() for v in variations if v.strip()))
-
-
-def _score_match(decedent_name: str, owner_string: str) -> float:
-    """Score how well an owner string matches a decedent name.
-
-    Returns 0..1. Joint owners ("SMITH JOHN & SMITH JANE") score high if the
-    decedent's first+last both appear as adjacent tokens.
-    """
-    dec_tokens = _name_tokens(decedent_name)
-    owner_tokens = _name_tokens(owner_string)
-    if not dec_tokens or not owner_tokens:
-        return 0.0
-
-    # Must have last name present
-    # Assume last token of decedent name is surname for natural order;
-    # comma-formatted ("SMITH, JOHN") starts with surname.
-    dec_surname = dec_tokens[-1]
-    if "," in decedent_name.split(" ", 1)[0]:
-        dec_surname = dec_tokens[0]
-    if dec_surname not in owner_tokens:
-        return 0.0
-
-    # Base: surname match
-    score = 0.5
-
-    # Bonus: first-name token appears
-    dec_first_candidates = [t for t in dec_tokens if t != dec_surname]
-    if dec_first_candidates:
-        dec_first = dec_first_candidates[0]
-        if dec_first in owner_tokens:
-            score += 0.35
-            # Extra bonus if surname + first are adjacent (dominant owner,
-            # not just a buried joint-owner mention)
-            try:
-                si = owner_tokens.index(dec_surname)
-                fi = owner_tokens.index(dec_first)
-                if abs(si - fi) <= 2:
-                    score += 0.1
-            except ValueError:
-                pass
-
-    # Penalty: owner string is an obvious business entity
-    if re.search(r"\b(LLC|INC|CORP|TRUST|LP|CO|COMPANY|BANK)\b", owner_string.upper()):
-        score -= 0.2
-
-    return max(0.0, min(score, 1.0))
+# Primitives (SUFFIX_RE, name_tokens, _search_variations, score_match) live in
+# the canonical kentucky_name_resolver module — imported at the top of this file.
 
 
 # ── Apply result to notice ────────────────────────────────────────────
@@ -780,7 +679,7 @@ def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
     for query in variations:
         rows = search_by_owner(session, query)
         for row in rows:
-            score = _score_match(primary_target, row.owner)
+            score = score_match(primary_target, row.owner)
             if score >= _MIN_MATCH_SCORE and (not best or score > best[0]):
                 best = (score, row, query)
         if best and best[0] >= 0.85:
@@ -966,7 +865,7 @@ def _heir_lookup_one(session: requests.Session, notice: "NoticeData") -> None:
             continue
         rows = search_by_owner(session, query)
         for row in rows:
-            score = _score_match(heir, row.owner)
+            score = score_match(heir, row.owner)
             if score >= _MIN_MATCH_SCORE and (not best or score > best[0]):
                 best = (score, row)
         if best and best[0] >= 0.85:

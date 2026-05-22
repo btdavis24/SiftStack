@@ -36,6 +36,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from kentucky_name_resolver import SUFFIX_RE
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -656,8 +657,8 @@ JCD_CNUM_DLIST = "20"
 _MORTGAGE_TERM_YEARS = 30
 _MORTGAGE_RATE = 0.06
 
-# Suffixes to strip when normalizing a decedent/owner name for JCD search.
-_SUFFIX_DEED_RE = re.compile(r"\b(JR|SR|II|III|IV|ESQ)\b\.?", re.IGNORECASE)
+# Suffixes to strip when normalizing a decedent/owner name for JCD search are
+# stripped via the canonical SUFFIX_RE imported from kentucky_name_resolver.
 
 
 @dataclass
@@ -1332,7 +1333,7 @@ def lookup_owner_deed_history(
 
     # Normalize KCOJ-style "LAST, FIRST MIDDLE" to "LAST FIRST MIDDLE" and
     # strip suffixes. JCD owner search wants space-separated tokens.
-    query = _SUFFIX_DEED_RE.sub("", query).strip()
+    query = SUFFIX_RE.sub("", query).strip()
     query = query.replace(",", " ")
     query = re.sub(r"\s+", " ", query).strip()
 

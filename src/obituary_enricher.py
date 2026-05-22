@@ -23,6 +23,10 @@ from ddgs import DDGS
 from datetime import datetime
 
 import llm_client
+# Canonical name primitives — pre-positioned for Plan 03/04 (obituary maiden /
+# aka extraction feeding generate_variants). Not yet wired into matching here;
+# this task only consolidates imports and does not alter obituary outputs.
+from kentucky_name_resolver import SUFFIX_RE, name_tokens, score_match  # noqa: F401
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -154,8 +158,11 @@ def _default_state(notice: "NoticeData") -> str:
         return "KY"
     return "TN"
 
-# Legal suffixes to strip from tax API owner names before searching
-_SUFFIX_RE = re.compile(
+# Role/legal suffixes to strip from tax API owner names before searching.
+# NOTE: This is the ROLE-suffix regex (LIFE ESTATE / PERSONAL REP / TRUSTEE /
+# TRUST / ETAL) — a different concern from the canonical JR/SR name-suffix
+# SUFFIX_RE in kentucky_name_resolver. Named distinctly to avoid the collision.
+_ROLE_SUFFIX_RE = re.compile(
     r"\s*\(?\s*(?:LIFE\s+EST(?:ATE)?|PERSONAL\s+REP(?:RESENTATIVE)?|"
     r"TRUSTEE|TRUST|ETAL|ET\s+AL)\s*\)?\s*$",
     re.IGNORECASE,
@@ -336,7 +343,7 @@ def parse_tax_owner_name(raw: str) -> list[str]:
         return []
 
     # Strip legal suffixes
-    name = _SUFFIX_RE.sub("", name).strip()
+    name = _ROLE_SUFFIX_RE.sub("", name).strip()
 
     # Handle care-of (%) — only search the primary name (before %)
     if "%" in name:
@@ -418,7 +425,7 @@ def _parse_notice_owner_name(raw: str) -> list[str]:
     # Strip notice-specific suffixes (Tenants By The Entirety, etc.)
     name = _NOTICE_SUFFIX_RE.sub("", name).strip()
     # Strip tax-API suffixes too (LIFE EST, ETAL, etc.)
-    name = _SUFFIX_RE.sub("", name).strip()
+    name = _ROLE_SUFFIX_RE.sub("", name).strip()
 
     # Split on " AND " (word) or "&" (symbol)
     parts = re.split(r"\s+AND\s+|\s*&\s*", name, flags=re.IGNORECASE)
