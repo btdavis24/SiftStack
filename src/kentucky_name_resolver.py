@@ -379,7 +379,116 @@ def generate_variants(decedent_name: str, *, maiden_name: str | None = None,
     return deduped
 
 
+# Disambiguation tuning (D-03). The threshold + margin is the NAME-02 guard:
+# below it we return None (manual queue) and NEVER auto-attach the wrong person.
+_ADDRESS_BONUS = 0.25     # corroboration when a candidate address overlaps known
+_AGE_PENALTY = 0.4        # demotion when candidate age is implausible vs expected
+_AGE_TOLERANCE = 10       # |candidate.age - expected_age| within this is fine
+_DISAMBIG_MARGIN = 0.1    # top must beat runner-up by this to be selected
+
+
+def _address_overlap(addresses: list[str] | None, known_addresses: list[str] | None) -> bool:
+    """True if any candidate address token-overlaps a known address (case-insensitive).
+
+    Uses a conservative substring match in both directions so "5007 MILES LN" and
+    "5007 Miles Ln, Louisville KY" corroborate. A bare match on a stop-word would
+    over-fire, so require the overlapping fragment to carry a digit (a street
+    number) OR be a multi-token street phrase.
+    """
+    if not addresses or not known_addresses:
+        return False
+    for addr in addresses:
+        a = (addr or "").strip().lower()
+        if not a:
+            continue
+        for known in known_addresses:
+            k = (known or "").strip().lower()
+            if not k:
+                continue
+            if a in k or k in a:
+                # Require a street-number digit so we don't match on city/state alone.
+                if any(ch.isdigit() for ch in a) or any(ch.isdigit() for ch in k):
+                    return True
+                # Or a shared multi-word street phrase (>= 2 tokens overlap).
+                if len(set(a.split()) & set(k.split())) >= 2:
+                    return True
+    return False
+
+
 def disambiguate(query_name: str, candidates: list[CandidatePerson], *,
                  expected_dod: str | None = None, known_addresses: list[str] | None = None,
-                 min_score: float = 0.6) -> "DisambigResult | None":
-    raise NotImplementedError  # filled in Task 2 (spec task 2e-3)
+                 min_score: float = 0.6, expected_age: int | None = None) -> "DisambigResult | None":
+    """Pick the right same-name person, or return None for the manual queue.
+
+    The NAME-02 correctness guard (spec task 2e-3 / D-03): a high name-string
+    score alone NEVER wins. We layer corroboration on top of ``score_match`` and
+    only return a result above the confidence threshold WITH a margin over the
+    runner-up. Below that -> None (manual queue), never an auto-attach.
+
+    Guards, in order:
+      * Death suppression — a candidate with ``dod`` set is dropped entirely
+        (a death index says they're dead): kills Davis (husband d.2012) and
+        Armstrong wrong-Barry when death is known.
+      * Age/DOD sanity — when ``expected_age`` is known, a candidate whose age
+        is implausible (|age - expected_age| > tolerance) is demoted: flips
+        Armstrong wrong-Barry (age 80) below threshold.
+      * Address corroboration — a bonus when a candidate address overlaps
+        ``known_addresses`` (decedent's parcel / prior addresses): breaks the
+        3-Thomas-Shavers tie (the one at the decedent's parcel wins).
+      * Threshold + margin — top candidate returned only if score >= min_score
+        AND it beats the runner-up by ``_DISAMBIG_MARGIN``; else None.
+
+    Args:
+        query_name: the decedent / target name to match candidates against.
+        candidates: same-name (or near) people assembled from PVA/people-search.
+        expected_dod: decedent date-of-death (presence signals a death context).
+        known_addresses: addresses tied to the decedent (parcel, prior homes).
+        min_score: confidence floor (default 0.6); below -> None (D-03).
+        expected_age: decedent's plausible age, for the age-sanity demotion.
+    """
+    if not candidates:
+        return None
+
+    scored: list[tuple[float, CandidatePerson, str]] = []
+    for cand in candidates:
+        # Death suppression — drop dead candidates outright (never scored).
+        if cand.dod:
+            continue
+
+        score = score_match(query_name, cand.name)
+        reasons: list[str] = []
+
+        # Age/DOD sanity — when a death context is known (expected_dod and/or
+        # expected_age supplied) demote a candidate whose age is implausible vs
+        # the decedent. Flips Armstrong wrong-Barry (age 80) below threshold.
+        if cand.age is not None and (expected_age is not None or expected_dod):
+            if expected_age is not None and abs(cand.age - expected_age) > _AGE_TOLERANCE:
+                score -= _AGE_PENALTY
+                reasons.append("age mismatch")
+
+        # Address corroboration — bonus for overlap with known addresses.
+        if _address_overlap(cand.addresses, known_addresses):
+            score += _ADDRESS_BONUS
+            reasons.append("address overlap")
+
+        score = max(0.0, score)  # floor at 0; do NOT cap here so corroboration
+        # always opens a real margin between same-name rivals (the 1.0 cap would
+        # erase it when two identical names both score 0.95). Cap only the value
+        # we return to the caller.
+        scored.append((score, cand, ", ".join(reasons) or "name match"))
+
+    if not scored:
+        # Every candidate was death-suppressed.
+        return None
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top_score, top_person, top_reason = scored[0]
+    runner_up = scored[1][0] if len(scored) > 1 else 0.0
+
+    # Threshold + margin (D-03) — never auto-attach below confidence.
+    if top_score < min_score:
+        return None
+    if top_score - runner_up < _DISAMBIG_MARGIN:
+        return None  # too close to a same-name rival -> manual queue
+
+    return DisambigResult(person=top_person, score=min(top_score, 1.0), reason=top_reason)
