@@ -159,13 +159,227 @@ class DisambigResult:
     reason: str
 
 
+# Confidence ranking for the variant sources (D-01..D-04). maiden_obit MUST
+# outrank maiden_positional (D-02); typo_fuzzy is last and off by default (D-04).
+_SOURCE_CONFIDENCE = {
+    "primary": 0.90,
+    "maiden_obit": 0.95,        # higher than positional per D-02
+    "maiden_positional": 0.55,  # fallback-only penultimate guess
+    "prior_married": 0.70,
+    "non_anglo_surname": 0.65,
+    "typo_fuzzy": 0.40,         # last resort, off by default per D-04
+}
+
+# Max name length we parse — bounds tokenization/regex cost (T-02-02).
+_MAX_NAME_LEN = 200
+
+
+def _fmt_for_value(value: str) -> str:
+    """Derive the structural ``fmt`` label from a search-string shape.
+
+    ESTATE OF ... -> ESTATE_OF; LAST FIRST MIDDLE -> LAST_FIRST_MIDDLE;
+    LAST FIRST -> LAST_FIRST; a single token -> SURNAME_ONLY.
+    """
+    if value.upper().startswith("ESTATE OF "):
+        return "ESTATE_OF"
+    n = len(value.split())
+    if n >= 3:
+        return "LAST_FIRST_MIDDLE"
+    if n == 2:
+        return "LAST_FIRST"
+    return "SURNAME_ONLY"
+
+
+def _maiden_positional(decedent_name: str) -> str | None:
+    """Penultimate-token maiden guess (ported from TN ``_maiden_name_variant``).
+
+    For 4+ token names like "LULA ELIZABETH MASSIE JONES" the penultimate token
+    ("MASSIE") is the likely maiden surname and the property may be titled
+    "MASSIE LULA". Returns ``{penultimate} {first}`` or None for shorter names.
+    Fallback ONLY — obituary maiden (``maiden_obit``) outranks it (D-02).
+    """
+    tokens = name_tokens(decedent_name)
+    if len(tokens) < 4:  # need FIRST MIDDLE MAIDEN MARRIED
+        return None
+    first = tokens[0]
+    maiden = tokens[-2]  # penultimate
+    return f"{maiden} {first}"
+
+
+def _levenshtein_le1(a: str, b: str) -> bool:
+    """True iff edit distance(a, b) <= 1. Bounded, early-exit (T-02-01).
+
+    Used only for the surname-token typo gate (D-04): MUST accept distance-1
+    (TOMPSON->THOMPSON, JACSON->JACKSON) and MUST reject distance-2
+    (MEIER->MILLER). Length difference > 1 is already > 1 edit, so reject fast.
+    """
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 1:
+        return False
+    # Identify the single allowed edit (substitution / insertion / deletion).
+    if la == lb:
+        # one substitution allowed
+        diffs = sum(1 for x, y in zip(a, b) if x != y)
+        return diffs <= 1
+    # lengths differ by exactly 1 -> one insertion/deletion allowed.
+    shorter, longer = (a, b) if la < lb else (b, a)
+    i = j = 0
+    edited = False
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+            j += 1
+        else:
+            if edited:
+                return False
+            edited = True
+            j += 1  # skip the extra char in the longer string
+    return True
+
+
+def _non_anglo_variants(decedent_name: str) -> list[str]:
+    """Emit per-surname variants for compound / maternal / hyphenated names.
+
+    Covers (CONTEXT-cited cases):
+      * Hyphenated: "PALMER-BALL X" -> full + each half ("PALMER X", "BALL X").
+        Compound same-token "GONZALEZ-GONZALEZ" collapses to ONE surname (sibling
+        cohort, not a typo) — only the deduped halves emit.
+      * Hispanic paternal+maternal (3 natural-order tokens FIRST PATERNAL MATERNAL):
+        a variant on EACH surname (Farinas: "GARCIA X" AND "FARINAS X"). A plain
+        2-token "FIRST LAST" name does NOT double.
+      * Slavic feminization: a surname ending in -AYA emits the masculine -IY form
+        (LOZINSKAYA -> LOZINSKIY).
+    """
+    tokens = name_tokens(decedent_name)
+    if len(tokens) < 2:
+        return []
+
+    out: list[str] = []
+    first = tokens[0]
+
+    # Hyphenated surname — look at the RAW (suffix-stripped, uppercased) string so
+    # the hyphen survives name_tokens (which would split on it).
+    raw = SUFFIX_RE.sub("", decedent_name).upper()
+    raw = re.sub(r"[^A-Z\s-]", " ", raw)
+    raw_parts = [p for p in raw.split() if len(p) > 1 or "-" in p]
+    hyphen_surnames = [p for p in raw_parts if "-" in p]
+    for surname in hyphen_surnames:
+        out.append(f"{surname} {first}")           # full hyphenated form
+        for half in surname.split("-"):
+            if half and half != first:
+                out.append(f"{half} {first}")       # each half
+
+    # Hispanic paternal+maternal: exactly 3 natural-order tokens, no comma, no
+    # hyphen — treat the last TWO tokens as candidate surnames (paternal+maternal).
+    if (len(tokens) == 3 and "," not in decedent_name and not hyphen_surnames):
+        paternal, maternal = tokens[1], tokens[2]
+        out.append(f"{paternal} {first}")
+        out.append(f"{maternal} {first}")
+
+    # Slavic feminization: surname ending -AYA -> masculine -IY form.
+    surname_last = tokens[-1]
+    if surname_last.endswith("AYA") and len(surname_last) > 3:
+        masculine = surname_last[:-3] + "IY"
+        out.append(f"{masculine} {first}")
+
+    return out
+
+
 def generate_variants(decedent_name: str, *, maiden_name: str | None = None,
                       prior_surnames: list[str] | None = None,
                       enable_fuzzy: bool = False) -> list[NameVariant]:
-    raise NotImplementedError  # filled in Plan 02 (task 2e-2)
+    """Produce ordered name-search variants for a decedent (spec task 2e-2).
+
+    Returns a list of ``NameVariant`` ordered highest-confidence-first and
+    deduped on ``.value`` (first occurrence wins, so the highest-confidence
+    source owns a shared string). Sources, in fixed order (D-01..D-04):
+
+      1. primary            — the existing ``_search_variations`` set.
+      2. maiden_obit        — when ``maiden_name`` given; outranks positional.
+      3. maiden_positional  — penultimate-token guess, fallback ONLY (no obit).
+      4. prior_married      — one ``{surname} {first}`` per ``prior_surnames``.
+      5. non_anglo_surname  — Hispanic dual / hyphen split / Slavic feminization.
+      6. typo_fuzzy         — surname Levenshtein<=1, ONLY if ``enable_fuzzy``.
+
+    Args:
+        decedent_name: the decedent's name (court or natural order).
+        maiden_name: obituary-confirmed maiden surname (preferred maiden source).
+        prior_surnames: prior-married / legal-change surnames (obit aka / deeds).
+        enable_fuzzy: opt-in clerk-typo tolerance (off by default, D-04).
+    """
+    if not decedent_name:
+        return []
+    # Bound parsing cost on adversarial / oversized input (T-02-02).
+    if len(decedent_name) > _MAX_NAME_LEN:
+        decedent_name = decedent_name[:_MAX_NAME_LEN]
+
+    tokens = name_tokens(decedent_name)
+    first = tokens[0] if tokens else ""
+    variants: list[NameVariant] = []
+
+    def _add(value: str, source: str) -> None:
+        value = value.strip()
+        if not value:
+            return
+        variants.append(NameVariant(
+            value=value, fmt=_fmt_for_value(value),
+            source=source, confidence=_SOURCE_CONFIDENCE[source],
+        ))
+
+    # 1. primary — reuse the promoted _search_variations set verbatim.
+    for v in _search_variations(decedent_name):
+        _add(v, "primary")
+
+    # 2. maiden_obit — preferred maiden source (D-02). Higher confidence.
+    if maiden_name and first:
+        maiden_tok = name_tokens(maiden_name)
+        if maiden_tok:
+            maiden_str = " ".join(maiden_tok)
+            _add(f"{maiden_str} {first}", "maiden_obit")
+            _add(f"ESTATE OF {maiden_str} {first}", "maiden_obit")
+    # 3. maiden_positional — fallback ONLY when no obit maiden was supplied.
+    elif first:
+        positional = _maiden_positional(decedent_name)
+        if positional:
+            _add(positional, "maiden_positional")
+
+    # 4. prior_married — one variant per prior surname (Underwood->Koenig->Price).
+    if prior_surnames and first:
+        for surname in prior_surnames:
+            stok = name_tokens(surname)
+            if stok:
+                _add(f"{' '.join(stok)} {first}", "prior_married")
+
+    # 5. non_anglo_surname — Hispanic dual / hyphen split / Slavic feminization.
+    for v in _non_anglo_variants(decedent_name):
+        _add(v, "non_anglo_surname")
+
+    # 6. typo_fuzzy — last resort, opt-in only (D-04). Surname Levenshtein<=1,
+    #    generated only after the exact sources are built.
+    if enable_fuzzy and len(tokens) >= 2:
+        surname = tokens[-1]
+        # Curated near-miss corrections keyed by the typo'd surname token.
+        _FUZZY_CANDIDATES = ("THOMPSON", "JACKSON", "JOHNSON", "WILLIAMS",
+                             "ROBINSON", "ANDERSON", "THOMAS", "RICHARDSON")
+        for cand in _FUZZY_CANDIDATES:
+            if cand != surname and _levenshtein_le1(surname, cand):
+                _add(f"{cand} {first}", "typo_fuzzy")
+
+    # Sort highest-confidence first (stable -> preserves intra-source order),
+    # then dedup on .value (first/highest-confidence occurrence wins).
+    variants.sort(key=lambda v: v.confidence, reverse=True)
+    seen: set[str] = set()
+    deduped: list[NameVariant] = []
+    for v in variants:
+        if v.value not in seen:
+            seen.add(v.value)
+            deduped.append(v)
+    return deduped
 
 
 def disambiguate(query_name: str, candidates: list[CandidatePerson], *,
                  expected_dod: str | None = None, known_addresses: list[str] | None = None,
                  min_score: float = 0.6) -> "DisambigResult | None":
-    raise NotImplementedError  # filled in Plan 02 (task 2e-3)
+    raise NotImplementedError  # filled in Task 2 (spec task 2e-3)
