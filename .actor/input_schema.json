@@ -2,7 +2,7 @@
     "title": "SiftStack Input",
     "type": "object",
     "schemaVersion": 1,
-    "required": ["mode", "tn_username", "tn_password", "captcha_api_key"],
+    "required": ["mode"],
     "properties": {
         "mode": {
             "title": "Scrape Mode",
@@ -44,23 +44,37 @@
             "editor": "number"
         },
         "tn_username": {
-            "title": "tnpublicnotice.com Email",
+            "title": "tnpublicnotice.com Email (TN foreclosure only)",
             "type": "string",
-            "description": "Login email for tnpublicnotice.com Smart Search",
+            "description": "Login email for tnpublicnotice.com Smart Search. Required only when 'types' includes a TN source (foreclosure). Leave blank for KY-only runs (probate / lis_pendens).",
             "editor": "textfield",
             "isSecret": true
         },
         "tn_password": {
-            "title": "tnpublicnotice.com Password",
+            "title": "tnpublicnotice.com Password (TN foreclosure only)",
             "type": "string",
-            "description": "Login password for tnpublicnotice.com",
+            "description": "Login password for tnpublicnotice.com. Required only for TN (foreclosure) searches; leave blank for KY-only runs.",
             "editor": "textfield",
             "isSecret": true
         },
         "captcha_api_key": {
-            "title": "2Captcha API Key",
+            "title": "2Captcha API Key (TN foreclosure only)",
             "type": "string",
-            "description": "API key from 2captcha.com for reCAPTCHA solving",
+            "description": "API key from 2captcha.com for reCAPTCHA solving. Required only for TN (tnpublicnotice.com) searches; KY probate (KCOJ) and lis_pendens (JCD) need no CAPTCHA.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "pva_email": {
+            "title": "Jefferson County PVA Email (KY probate / lis pendens)",
+            "type": "string",
+            "description": "Login email for the Jefferson County KY PVA subscription (jeffersonpva.ky.gov). Required for KY probate and lis_pendens enrichment — property values, deeds, and equity. Not used by TN foreclosure-only runs.",
+            "editor": "textfield",
+            "isSecret": true
+        },
+        "pva_password": {
+            "title": "Jefferson County PVA Password (KY probate / lis pendens)",
+            "type": "string",
+            "description": "Login password for the Jefferson County KY PVA, paired with the PVA email. Required for KY probate and lis_pendens enrichment.",
             "editor": "textfield",
             "isSecret": true
         },
