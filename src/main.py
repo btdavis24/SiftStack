@@ -488,6 +488,30 @@ async def actor_main() -> None:
                         )
                     except Exception as e:
                         Actor.log.warning("Skip-trace guard/fallback failed: %s — continuing", e)
+
+                    # ── Phase 5→6 bridge (BLOCKER-2) ──────────────────────────
+                    # Phase 5's 2g-6 (handle_credits_exhausted) + AOC-805 fallback set
+                    # notice.repoll_after on a FIELD; copy those into the
+                    # kcoj_repoll_queue DICT so the NEXT run's drain re-searches them.
+                    # Reuses the already-built dp_for_tracerfy list; idempotent on an
+                    # existing key; re-persists to KVS so the queue survives the run.
+                    try:
+                        from kcoj_repoll_queue import enqueue_repoll, make_key, save_repoll_queue
+                        bridged = 0
+                        for n in dp_for_tracerfy:
+                            if getattr(n, "repoll_after", "").strip():
+                                k = make_key(n)
+                                if k:
+                                    enqueue_repoll(kcoj_repoll_queue, k, reason="credits_exhausted")
+                                    bridged += 1
+                        save_repoll_queue(kcoj_repoll_queue)
+                        await kvs.set_value("kcoj_repoll_queue", kcoj_repoll_queue)
+                        Actor.log.info(
+                            "Phase 5→6 bridge: enqueued %d repoll_after notice(s) into kcoj_repoll_queue",
+                            bridged,
+                        )
+                    except Exception as e:
+                        Actor.log.warning("Re-poll bridge failed: %s — continuing", e)
                 else:
                     Actor.log.info("No DP candidates — Tracerfy skipped (0 deceased/DM records)")
             elif do_tracerfy:
@@ -2132,6 +2156,33 @@ def _run_scrape_pipeline(args, searches) -> None:
                 )
             except Exception as e:
                 logging.warning("Skip-trace guard/fallback failed: %s — continuing", e)
+
+            # ── Phase 5→6 bridge (BLOCKER-2) ──────────────────────────────────
+            # Phase 5's 2g-6 (handle_credits_exhausted) + AOC-805 fallback set
+            # notice.repoll_after on a FIELD; copy those into the kcoj_repoll_queue
+            # DICT so the NEXT run's drain re-searches them. CLI is file-backed:
+            # load the same KCOJ_REPOLL_FILE the start-of-next-run drain reads,
+            # enqueue, and save. Reuses the already-built trace_candidates list;
+            # idempotent on an existing key.
+            try:
+                from kcoj_repoll_queue import (
+                    enqueue_repoll, make_key, load_repoll_queue, save_repoll_queue,
+                )
+                bridge_q = load_repoll_queue()
+                bridged = 0
+                for n in trace_candidates:
+                    if getattr(n, "repoll_after", "").strip():
+                        k = make_key(n)
+                        if k:
+                            enqueue_repoll(bridge_q, k, reason="credits_exhausted")
+                            bridged += 1
+                save_repoll_queue(bridge_q)
+                logging.info(
+                    "Phase 5→6 bridge: enqueued %d repoll_after notice(s) into kcoj_repoll_queue",
+                    bridged,
+                )
+            except Exception as e:
+                logging.warning("Re-poll bridge failed: %s — continuing", e)
 
             # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
             # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
