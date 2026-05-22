@@ -211,6 +211,62 @@ def _filter_fit(notices: list[NoticeData]) -> list[NoticeData]:
     return kept
 
 
+def _run_no_probate_branch(notices: list[NoticeData]) -> tuple[int, int]:
+    """No-probate / unknown-heir branch (Phase 6 / COVER-02).
+
+    Deaths that surfaced with NO usable CourtNet party graph — a Warning-Order-
+    Attorney, or 0 parties (McGarvey tax-foreclosure, Walker intestate, Combs/
+    Cooper/Dorsey/Gonzalez/Herflicker/Rutter/Spencer/Thompson-Hale) — would
+    otherwise be DROPPED with no DM. Route each eligible candidate to the shared
+    ``heir_identifier.identify_heirs`` waterfall and write the candidates into
+    ``heir_map_json`` so the existing skip-trace (Phase 5) + report paths consume
+    them unchanged.
+
+    A candidate must satisfy ALL of: ``eligible_for_heir_id`` (a death),
+    ``no_usable_party_graph`` (blank owner_name + 0-parties / Warning-Order-
+    Attorney), and not already carry heirs — so normal probate with a real
+    executor-filled DM is NEVER touched (T-06-10) and the work is bounded
+    (T-06-12). Extracted as a module-level callable so it is testable network-free
+    (the test monkeypatches identify_heirs); the network/IO lives entirely inside
+    identify_heirs. Returns (hits, candidate_count).
+
+    Uses the PUBLIC ``eligible_for_heir_id`` gate + ``no_usable_party_graph``
+    predicate via normal imports — no dynamic-import trick, no private gate name.
+    """
+    from heir_identifier import (
+        identify_heirs, write_heir_map, eligible_for_heir_id,
+    )
+    from kcoj_case_detail import no_usable_party_graph
+
+    candidates = [
+        n for n in notices
+        if eligible_for_heir_id(n)
+        and no_usable_party_graph(n)
+        and not n.heir_map_json.strip()
+    ]
+    logger.info(
+        "── Step 9.5: No-probate heir branch (%d candidate(s)) ──",
+        len(candidates),
+    )
+    hits = 0
+    for n in candidates:
+        try:
+            heirs = identify_heirs(n)
+            if heirs:
+                write_heir_map(n, heirs)
+                hits += 1
+        except Exception as e:  # one bad notice must not abort the branch
+            logger.warning(
+                "  No-probate branch failed for %r: %s",
+                n.decedent_name or n.owner_name, e,
+            )
+    logger.info(
+        "  No-probate branch: %d/%d produced candidate heirs",
+        hits, len(candidates),
+    )
+    return hits, len(candidates)
+
+
 def _compute_mailable(notices: list[NoticeData]) -> None:
     """Set mailable flag: 'yes' if address + city + zip all present."""
     for n in notices:
@@ -827,39 +883,7 @@ def run_enrichment_pipeline(
     # candidates already carrying heirs are skipped.
     if not opts.skip_heir_verification:
         try:
-            # PUBLIC gate + predicate via normal imports only (no dynamic-import
-            # trick, no reference to any private gate name).
-            from heir_identifier import (
-                identify_heirs, write_heir_map, eligible_for_heir_id,
-            )
-            from kcoj_case_detail import no_usable_party_graph
-
-            candidates = [
-                n for n in notices
-                if eligible_for_heir_id(n)
-                and no_usable_party_graph(n)
-                and not n.heir_map_json.strip()
-            ]
-            logger.info(
-                "── Step 9.5: No-probate heir branch (%d candidate(s)) ──",
-                len(candidates),
-            )
-            hits = 0
-            for n in candidates:
-                try:
-                    heirs = identify_heirs(n)
-                    if heirs:
-                        write_heir_map(n, heirs)
-                        hits += 1
-                except Exception as e:  # one bad notice must not abort the branch
-                    logger.warning(
-                        "  No-probate branch failed for %r: %s",
-                        n.decedent_name or n.owner_name, e,
-                    )
-            logger.info(
-                "  No-probate branch: %d/%d produced candidate heirs",
-                hits, len(candidates),
-            )
+            _run_no_probate_branch(notices)
         except ImportError as e:
             logger.warning(
                 "── Step 9.5: No-probate branch unavailable (%s) — skipping ──", e
