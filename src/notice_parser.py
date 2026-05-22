@@ -58,6 +58,7 @@ class NoticeData:
     estimated_value: str = ""      # Zestimate
     estimated_equity: str = ""     # zestimate - estimated remaining mortgage
     equity_percent: str = ""       # (equity / zestimate) * 100
+    lien_flags: str = ""           # 2d — semicolon-delimited haircut flags: open_mortgage;hecm;judgment;lis_pendens;tax_cert;medicaid
     property_type: str = ""        # "Single Family", "Condo", etc.
     bedrooms: str = ""
     bathrooms: str = ""
