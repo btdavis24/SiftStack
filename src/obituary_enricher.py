@@ -44,6 +44,31 @@ MAX_ADDRESS_TEXT = 15000  # Larger limit for people search pages (CBC has 250+ r
 # Probate is typically filed within 1-2 years of death. 3 years gives margin.
 MAX_DOD_GAP_YEARS = 3
 
+# Re-poll enqueue freshness window (Phase 6 / COVER-01): only a recently-filed
+# decedent whose obituary isn't posted yet is "plausibly just-not-posted-yet".
+# A filing older than this is treated as stale (the obituary should exist by now
+# if it ever will), so it is NOT enqueued for re-poll. Unparseable / missing
+# date_added is treated as fresh (daily-run leads are fresh by construction).
+REPOLL_OBIT_FRESH_DAYS = 30
+
+
+def _is_fresh_filing_for_repoll(notice: "NoticeData", today: str | None = None) -> bool:
+    """True when ``notice`` is a plausibly-just-filed lead whose obituary may
+    simply not be posted yet (enqueue-worthy), False when clearly stale.
+
+    Missing or unparseable ``date_added`` -> True (fresh by default; daily-run
+    leads are fresh). A filing older than ``REPOLL_OBIT_FRESH_DAYS`` -> False."""
+    raw = (getattr(notice, "date_added", "") or "").strip()
+    if not raw:
+        return True
+    try:
+        filed = datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return True
+    ref = datetime.strptime(today, "%Y-%m-%d") if today else datetime.now()
+    age_days = (ref - filed).days
+    return age_days <= REPOLL_OBIT_FRESH_DAYS
+
 
 def _dod_sanity_check(dod_str: str, notice: "NoticeData") -> bool:
     """Reject obituary matches where DOD is implausibly far from the notice date.
@@ -2324,6 +2349,7 @@ def enrich_obituary_data(
     skip_dm_address: bool = False,
     tracerfy_tier1: bool = False,
     skip_ancestry: bool = False,
+    repoll_queue: dict | None = None,
 ) -> None:
     """Search for obituaries and enrich notices with deceased owner data.
 
@@ -2332,6 +2358,14 @@ def enrich_obituary_data(
       Phase B: For each confirmed deceased, verify heirs alive/dead,
                rank decision-makers, and apply joint-owner fallback
                for snippet-only matches without survivors.
+
+    Re-poll queue (Phase 6 / COVER-01): a just-filed decedent whose obituary
+    search turns up nothing may simply not be posted online yet. Instead of
+    dropping that lead, enqueue it for a delayed re-search when an opt-in
+    ``repoll_queue`` dict is passed. Only plausibly-just-not-posted-yet fresh
+    filings are enqueued — a notice whose obituary WAS found, or whose filing
+    is clearly stale, is left alone. ``repoll_queue=None`` (the default) leaves
+    behavior unchanged for existing callers/tests.
 
     Updates notices in-place.
     """
@@ -2767,6 +2801,32 @@ def enrich_obituary_data(
                 logger.warning("Ancestry fallback failed: %s", e)
     elif not skip_ancestry:
         logger.debug("Ancestry: no credentials configured — skipping")
+
+    # ── Re-poll enqueue: just-filed decedents with no obituary yet ─────
+    # COVER-01 locked decision 1 — re-poll, don't drop. A candidate that never
+    # made it into `matches` had no obituary (and no Ancestry hit) and is NOT a
+    # probate-preset (those are court-named, not obituary-confirmed). When an
+    # opt-in queue is passed, enqueue such a lead for a delayed re-search instead
+    # of dropping it — but only when the data is plausibly just-not-posted-yet:
+    #   * skip notices whose obituary WAS found (matched_notices below), and
+    #   * skip clearly-stale filings (the obituary should already exist).
+    # enqueue_repoll is idempotent on an existing key (the drain in 06-03b owns
+    # attempt-bumping) and no-ops on an unkeyable lead (empty make_key).
+    if repoll_queue is not None:
+        from kcoj_repoll_queue import enqueue_repoll, make_key
+        matched_notices = {id(m[0]) for m in matches}
+        for notice, _raw_name, _is_tax_name in candidates:
+            if id(notice) in matched_notices:
+                continue  # obituary / Ancestry confirmed — not a "no obit yet" lead
+            if not _is_fresh_filing_for_repoll(notice):
+                continue  # stale filing — obituary should already exist if it ever will
+            key = make_key(notice)
+            if key:
+                enqueue_repoll(repoll_queue, key, reason="obituary_empty")
+                logger.info(
+                    "  [Obit] %s: no obituary yet — enqueued for re-poll",
+                    notice.decedent_name or notice.owner_name,
+                )
 
     # ── Phase B: Heir verification + ranked DMs + joint-owner fallback ─
 
