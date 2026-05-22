@@ -191,6 +191,10 @@ class NoticeData:
     wholesale_fit_score: str = ""        # "0"-"100" — fit score from score_wholesale_fit (string for CSV consistency)
     fit_drop_reason: str = ""            # e.g. "no_property", "out_of_estate", "negative_equity", "teardown", "luxury_tier", ""
     dm_sophisticated: str = ""           # manual hook (v1): "yes" if the DM is a sophisticated seller (RIA, flipper); NOT auto-detected (locked decision 3)
+    # Re-poll / no-probate coverage (Phase 6; COVER-01/COVER-02).
+    # repoll_after is OWNED by Phase 5 (plan 05-01) — do NOT redefine it here.
+    repoll_attempts: str = ""    # count of re-poll attempts already made on this lead's queue entry
+    heir_id_source: str = ""     # which heir_identifier source filled heir_map_json ("obituary"|"affidavit_descent"|"deed_grantor"|"people_search")
 
 
 # ── Known cities in target markets ────────────────────────────────────
