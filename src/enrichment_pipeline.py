@@ -498,6 +498,41 @@ def run_enrichment_pipeline(
         except Exception as e:
             logger.warning("  [Jefferson] Equity estimation failed: %s", e)
 
+    # ── Step 3f: KY Title-Path Classifier (Phase 2f) ─────────────────
+    # Classify each Jefferson probate notice's title path (standard_probate /
+    # successor_trustee / surviving_owner / out_of_estate / no_property) from
+    # the PVA owner string (Step 3d) + deed chain (Step 3c) vs DOD. Runs LAST
+    # in the KY block so the classifier sees the final 3c/3d/3e inputs, before
+    # the CourtNet party step uses title_path to route the decision-maker.
+    # Gate on Jefferson + probate ONLY — NO address-absence filter: ALL
+    # Jefferson probate notices must be classified (including those WITH a
+    # property) so every one exits enrichment with a non-empty title_path. The
+    # no_property rule inside classify_title_path handles the address-less
+    # renters; the loop must still pass them in.
+    title_candidates = [
+        n for n in notices
+        if n.county.lower() == "jefferson"
+        and n.notice_type == "probate"
+    ]
+    if title_candidates:
+        logger.info(
+            "── Step 3f: KY Title-Path Classifier (%d candidates) ──",
+            len(title_candidates),
+        )
+        try:
+            from kentucky_title_classifier import classify_title_path
+            for n in title_candidates:
+                classify_title_path(n)
+            logger.info(
+                "  [Jefferson] title_path set: %d/%d",
+                sum(1 for n in title_candidates if n.title_path.strip()),
+                len(title_candidates),
+            )
+        except ImportError:
+            logger.warning("  [Jefferson] kentucky_title_classifier not available — skipping")
+        except Exception as e:
+            logger.warning("  [Jefferson] Title-path classification failed: %s", e)
+
     # ── Step 4: Parcel Address Lookup ────────────────────────────────
     # Dispatch per-county: given a parcel_id, resolve to a street address via
     # the county's assessor API. Same dispatch pattern as Step 3c.
