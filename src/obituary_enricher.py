@@ -299,6 +299,8 @@ Include partial names (e.g. just a first name) — use the deceased's last name 
 Include full names when available. (city is where the survivor lives if mentioned, empty string if not stated)
 - "preceded_in_death": array of names of family members who predeceased them
 - "executor_named": name of executor/personal representative if mentioned, empty string if not
+- "maiden_name": the deceased's maiden/birth surname if stated (e.g. "née Smith", "formerly Smith", "maiden name Smith", or a surname in parentheses after the first name), empty string if not found
+- "also_known_as": array of any OTHER prior or alternate surnames the deceased used (prior married names, legal name changes, "formerly Jones"), empty array if none
 
 Important: Only set "match" to true if the first AND last name match the owner. \
 Common names need location confirmation. Be conservative — a false negative is better \
@@ -2085,6 +2087,16 @@ def _apply_obituary_match(
     notice.date_of_death = parsed.get("date_of_death", "")
     notice.obituary_url = url
     notice.obituary_source_type = source_type
+
+    # Read obituary-extracted maiden / also-known-as surnames (NAME-03). The
+    # values come from an untrusted LLM response, so read defensively: a
+    # missing/null/non-list value must never raise (T-03-01). Persist them on
+    # the obituary result (mirror how survivors/executor_named are read) so the
+    # downstream wiring can feed them into the name-variant generator.
+    maiden_name = (parsed.get("maiden_name", "") or "").strip()
+    also_known_as = [s for s in (parsed.get("also_known_as", []) or []) if str(s).strip()]
+    parsed["maiden_name"] = maiden_name
+    parsed["also_known_as"] = also_known_as
 
     if ranked_dms:
         # Deep prospecting: apply top 3 ranked decision-makers
