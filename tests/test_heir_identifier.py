@@ -143,11 +143,13 @@ def test_below_confidence_flagged_manual(monkeypatch):
                    heir_map_json="", decision_maker_name="")
     # Force the earlier deed sources to yield nothing so the people-search runs.
     monkeypatch.setattr(hi, "_fetch_deed_records", lambda notice: [])
-    # Canned people-search candidate that disambiguate() would reject (returns None
-    # = below threshold / too close to a same-name rival).
+    # Canned people-search candidate that disambiguate() rejects: a next-of-kin
+    # with a DIFFERENT surname (the common real case — married daughter). score_match
+    # against the decedent surname is 0 -> below the 0.6 floor -> None -> manual_review.
+    # Proves a below-confidence candidate is KEPT (not dropped) and NOT promoted.
     monkeypatch.setattr(hi, "_people_search_candidates",
                         lambda notice, variants: [
-                            {"name": "FRANK DORSEY", "relationship": "possible_heir"},
+                            {"name": "PATRICIA HAWKINS", "relationship": "possible_heir"},
                         ])
 
     heirs = hi.identify_heirs(n)
