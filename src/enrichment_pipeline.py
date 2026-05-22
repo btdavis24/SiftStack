@@ -36,6 +36,7 @@ class PipelineOptions:
     skip_entity_filter: bool = False
     skip_entity_research: bool = True   # opt-in via --research-entities
     skip_commercial_filter: bool = False
+    skip_fit_filter: bool = False       # Phase 4: wholesale-fit gate (final step)
     skip_parcel_lookup: bool = False
     skip_tax: bool = False
     skip_smarty: bool = False
@@ -171,6 +172,99 @@ def _filter_commercial(notices: list[NoticeData]) -> list[NoticeData]:
     if removed:
         logger.info("  Removed %d commercial properties", removed)
     return result
+
+
+def _filter_fit(notices: list[NoticeData]) -> list[NoticeData]:
+    """Score wholesale fit and drop the unworkable (hard-fail) leads.
+
+    Stamps wholesale_fit_score + fit_drop_reason on EVERY record. Hard-drops
+    (drop=True: no_property / out_of_estate / negative_equity / teardown) are
+    excluded — like the vacant/entity/commercial filters — with a one-line audit
+    log per drop. Soft demotions (luxury / thin-equity / sophisticated DM) are
+    KEPT with their score + reason (locked decision 1: never silently lose a lead
+    the user might still mail; the gate only governs PAID skip trace downstream).
+    """
+    from wholesale_fit import score_wholesale_fit
+
+    kept: list[NoticeData] = []
+    dropped_by_reason: dict[str, int] = {}
+    for n in notices:
+        try:
+            res = score_wholesale_fit(n)
+        except Exception as e:
+            # Resilient (CONVENTIONS.md): a scoring error keeps the record
+            # rather than crashing the run.
+            logger.warning("  Fit scoring failed for %s: %s — keeping record", n.address, e)
+            kept.append(n)
+            continue
+        n.wholesale_fit_score = str(res.score)
+        n.fit_drop_reason = res.reason
+        if res.drop:
+            dropped_by_reason[res.reason] = dropped_by_reason.get(res.reason, 0) + 1
+            logger.info("  [fit-drop] %s — %s (score %d)", n.address or n.owner_name, res.reason, res.score)
+        else:
+            kept.append(n)
+    removed = len(notices) - len(kept)
+    if removed:
+        breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(dropped_by_reason.items()))
+        logger.info("  Removed %d unworkable leads before skip trace (%s)", removed, breakdown)
+    return kept
+
+
+def _run_no_probate_branch(notices: list[NoticeData]) -> tuple[int, int]:
+    """No-probate / unknown-heir branch (Phase 6 / COVER-02).
+
+    Deaths that surfaced with NO usable CourtNet party graph — a Warning-Order-
+    Attorney, or 0 parties (McGarvey tax-foreclosure, Walker intestate, Combs/
+    Cooper/Dorsey/Gonzalez/Herflicker/Rutter/Spencer/Thompson-Hale) — would
+    otherwise be DROPPED with no DM. Route each eligible candidate to the shared
+    ``heir_identifier.identify_heirs`` waterfall and write the candidates into
+    ``heir_map_json`` so the existing skip-trace (Phase 5) + report paths consume
+    them unchanged.
+
+    A candidate must satisfy ALL of: ``eligible_for_heir_id`` (a death),
+    ``no_usable_party_graph`` (blank owner_name + 0-parties / Warning-Order-
+    Attorney), and not already carry heirs — so normal probate with a real
+    executor-filled DM is NEVER touched (T-06-10) and the work is bounded
+    (T-06-12). Extracted as a module-level callable so it is testable network-free
+    (the test monkeypatches identify_heirs); the network/IO lives entirely inside
+    identify_heirs. Returns (hits, candidate_count).
+
+    Uses the PUBLIC ``eligible_for_heir_id`` gate + ``no_usable_party_graph``
+    predicate via normal imports — no dynamic-import trick, no private gate name.
+    """
+    from heir_identifier import (
+        identify_heirs, write_heir_map, eligible_for_heir_id,
+    )
+    from kcoj_case_detail import no_usable_party_graph
+
+    candidates = [
+        n for n in notices
+        if eligible_for_heir_id(n)
+        and no_usable_party_graph(n)
+        and not n.heir_map_json.strip()
+    ]
+    logger.info(
+        "── Step 9.5: No-probate heir branch (%d candidate(s)) ──",
+        len(candidates),
+    )
+    hits = 0
+    for n in candidates:
+        try:
+            heirs = identify_heirs(n)
+            if heirs:
+                write_heir_map(n, heirs)
+                hits += 1
+        except Exception as e:  # one bad notice must not abort the branch
+            logger.warning(
+                "  No-probate branch failed for %r: %s",
+                n.decedent_name or n.owner_name, e,
+            )
+    logger.info(
+        "  No-probate branch: %d/%d produced candidate heirs",
+        hits, len(candidates),
+    )
+    return hits, len(candidates)
 
 
 def _compute_mailable(notices: list[NoticeData]) -> None:
@@ -345,48 +439,230 @@ def run_enrichment_pipeline(
         logger.warning("No records remaining after filtering")
         return notices
 
-    # ── Step 3c: Probate Property Lookup ────────────────────────────
-    # For probate records without a property address, search Knox Tax API
-    # by the decedent's name to find their property.
+    # ── Step 3b.5: KY CourtNet Case Parties ──────────────────────────
+    # For Jefferson probate records with a case_number (populated by the
+    # KCOJ docket scraper), look up the case's party list via CourtNet 2.0
+    # guest access. Populates owner_name with the executor/administrator
+    # when visible, and estate_attorney_name with the estate's attorney.
+    # Runs BEFORE property lookup so downstream steps can use the resolved
+    # PR name as a fallback search term. Async-only (uses Playwright).
+    courtnet_candidates = [
+        n for n in notices
+        if n.notice_type == "probate"
+        and n.county.lower() == "jefferson"
+        and n.case_number.strip()
+        and not n.owner_name.strip()
+    ]
+    if courtnet_candidates and config.CAPTCHA_API_KEY:
+        logger.info(
+            "── Step 3b.5: KY CourtNet Case Parties (%d candidate(s)) ──",
+            len(courtnet_candidates),
+        )
+        try:
+            import asyncio
+            from kcoj_case_detail import enrich_case_parties
+            try:
+                asyncio.get_running_loop()
+                # Already in an event loop (pipeline called from async context)
+                logger.warning(
+                    "  [CourtNet] pipeline already in an event loop — "
+                    "scheduling is caller's responsibility; skipping"
+                )
+            except RuntimeError:
+                asyncio.run(enrich_case_parties(courtnet_candidates))
+            filled_exec = sum(1 for n in courtnet_candidates if n.owner_name.strip())
+            filled_atty = sum(1 for n in courtnet_candidates if n.estate_attorney_name.strip())
+            logger.info(
+                "  [CourtNet] owner_name filled: %d/%d | attorney filled: %d/%d",
+                filled_exec, len(courtnet_candidates),
+                filled_atty, len(courtnet_candidates),
+            )
+        except ImportError:
+            logger.warning("  [CourtNet] kcoj_case_detail not available — skipping")
+        except Exception as e:
+            logger.warning("  [CourtNet] case-detail lookup failed: %s", e)
+    elif courtnet_candidates and not config.CAPTCHA_API_KEY:
+        logger.info(
+            "── Step 3b.5: KY CourtNet (skipped — CAPTCHA_API_KEY not set) ──"
+        )
+
+    # ── Step 3c: KY Deed History (Phase 2b) ─────────────────────────
+    # Reversed-flow architecture: deeds run BEFORE the PVA lookup.
+    # The deed scraper finds the decedent's deed records, walks the
+    # chain to identify the current title holder (decedent / estate /
+    # trust / heir), and captures mortgage history. The discovered
+    # holder name then drives Phase 2a's PVA search — bypassing the
+    # ~80% miss rate of "PVA-by-decedent-name" on real probate cases.
+    ky_mortgage_candidates = [
+        n for n in notices
+        if n.county.lower() == "jefferson"
+        and (n.decedent_name.strip() or n.owner_name.strip())
+        and not n.mortgage_balance_estimate.strip()
+    ]
+    if ky_mortgage_candidates:
+        logger.info(
+            "── Step 3c: KY Deed History + current-holder discovery (%d candidates) ──",
+            len(ky_mortgage_candidates),
+        )
+        try:
+            from jefferson_deeds_scraper import enrich_mortgage_balances
+            enrich_mortgage_balances(ky_mortgage_candidates)
+            enriched = sum(1 for n in ky_mortgage_candidates if n.mortgage_original_amount.strip())
+            holders = sum(1 for n in ky_mortgage_candidates if n.current_property_holder.strip())
+            logger.info(
+                "  [Jefferson] Active mortgage: %d/%d | Current-holder identified: %d/%d",
+                enriched, len(ky_mortgage_candidates),
+                holders, len(ky_mortgage_candidates),
+            )
+        except ImportError:
+            logger.warning("  [Jefferson] jefferson_deeds_scraper not available — skipping")
+        except Exception as e:
+            logger.warning("  [Jefferson] Deed history lookup failed: %s", e)
+
+    # ── Step 3d: Probate Property Lookup (Phase 2a) ─────────────────
+    # PVA lookup, gated on either a decedent name or a deed-discovered
+    # current-property-holder. Knox uses the legacy decedent-only path;
+    # Jefferson uses the new current_property_holder when populated by
+    # Step 3c, falling back to decedent_name otherwise.
     probate_no_addr = [
         n for n in notices
         if n.notice_type == "probate"
         and not n.address.strip()
         and n.decedent_name.strip()
-        and n.county.lower() == "knox"
     ]
     if probate_no_addr:
-        logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
+        logger.info("── Step 3d: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
+        by_county: dict[str, list] = {}
+        for n in probate_no_addr:
+            by_county.setdefault(n.county.lower(), []).append(n)
+
+        for county_key, group in by_county.items():
+            if county_key == "knox":
+                try:
+                    from tax_enricher import _probate_property_lookup
+                    _probate_property_lookup(group)
+                    found = sum(1 for n in group if n.address.strip())
+                    logger.info("  [Knox] Property address found: %d/%d", found, len(group))
+                except ImportError:
+                    logger.warning("  [Knox] _probate_property_lookup not available — skipping")
+                except Exception as e:
+                    logger.warning("  [Knox] Probate property lookup failed: %s", e)
+            elif county_key == "jefferson":
+                try:
+                    from kentucky_pva_lookup import probate_property_lookup as _ky_probate_lookup
+                    _ky_probate_lookup(group)
+                    found = sum(1 for n in group if n.address.strip())
+                    logger.info("  [Jefferson] Property address found: %d/%d", found, len(group))
+                except ImportError:
+                    logger.warning("  [Jefferson] kentucky_pva_lookup not available — skipping")
+                except Exception as e:
+                    logger.warning("  [Jefferson] PVA probate lookup failed: %s", e)
+            else:
+                logger.info(
+                    "  [%s] %d record(s) — no property-lookup backend configured",
+                    county_key.title(), len(group),
+                )
+
+    # Step 3d.5 (separate heir PVA lookup) was removed — Phase 2a now
+    # uses ``current_property_holder`` directly from Phase 2b's deed
+    # chain analysis, which catches the heir-recent / trust / estate
+    # paths in a single search.
+
+    # ── Step 3e: KY Equity Estimator ─────────────────────────────────
+    # Compute estimated_equity + equity_percent for Jefferson records from
+    # the PVA assessed value (Step 3c) and mortgage balance (Step 3d). Uses
+    # an 85%-of-assessed fallback when mortgage signal is unknown. Runs
+    # last in the KY block so it sees the final values from 3c/3d.
+    ky_equity_candidates = [
+        n for n in notices
+        if n.county.lower() == "jefferson"
+        and n.estimated_value.strip()
+        and not n.estimated_equity.strip()
+    ]
+    if ky_equity_candidates:
         try:
-            from tax_enricher import _probate_property_lookup
-            _probate_property_lookup(probate_no_addr)
-            found = sum(1 for n in probate_no_addr if n.address.strip())
-            logger.info("  Property address found: %d/%d", found, len(probate_no_addr))
+            from kentucky_equity_estimator import enrich_equity
+            count = enrich_equity(ky_equity_candidates)
+            logger.info(
+                "── Step 3e: KY Equity Estimator — %d/%d enriched ──",
+                count, len(ky_equity_candidates),
+            )
         except ImportError:
-            logger.warning("  _probate_property_lookup not available — skipping")
+            logger.warning("  [Jefferson] kentucky_equity_estimator not available — skipping")
         except Exception as e:
-            logger.warning("  Probate property lookup failed: %s", e)
+            logger.warning("  [Jefferson] Equity estimation failed: %s", e)
+
+    # ── Step 3f: KY Title-Path Classifier (Phase 2f) ─────────────────
+    # Classify each Jefferson probate notice's title path (standard_probate /
+    # successor_trustee / surviving_owner / out_of_estate / no_property) from
+    # the PVA owner string (Step 3d) + deed chain (Step 3c) vs DOD. Runs LAST
+    # in the KY block so the classifier sees the final 3c/3d/3e inputs, before
+    # the CourtNet party step uses title_path to route the decision-maker.
+    # Gate on Jefferson + probate ONLY — NO address-absence filter: ALL
+    # Jefferson probate notices must be classified (including those WITH a
+    # property) so every one exits enrichment with a non-empty title_path. The
+    # no_property rule inside classify_title_path handles the address-less
+    # renters; the loop must still pass them in.
+    title_candidates = [
+        n for n in notices
+        if n.county.lower() == "jefferson"
+        and n.notice_type == "probate"
+    ]
+    if title_candidates:
+        logger.info(
+            "── Step 3f: KY Title-Path Classifier (%d candidates) ──",
+            len(title_candidates),
+        )
+        try:
+            from kentucky_title_classifier import classify_title_path
+            for n in title_candidates:
+                classify_title_path(n)
+            logger.info(
+                "  [Jefferson] title_path set: %d/%d",
+                sum(1 for n in title_candidates if n.title_path.strip()),
+                len(title_candidates),
+            )
+        except ImportError:
+            logger.warning("  [Jefferson] kentucky_title_classifier not available — skipping")
+        except Exception as e:
+            logger.warning("  [Jefferson] Title-path classification failed: %s", e)
 
     # ── Step 4: Parcel Address Lookup ────────────────────────────────
+    # Dispatch per-county: given a parcel_id, resolve to a street address via
+    # the county's assessor API. Same dispatch pattern as Step 3c.
     if not opts.skip_parcel_lookup and not opts.skip_tax:
-        candidates = [
-            n
-            for n in notices
-            if n.parcel_id.strip() and n.county.lower() == "knox"
-        ]
+        candidates = [n for n in notices if n.parcel_id.strip()]
         if candidates:
+            by_county = {}
+            for n in candidates:
+                by_county.setdefault(n.county.lower(), []).append(n)
+
             logger.info(
                 "── Step 4: Parcel Address Lookup (%d candidates) ──",
                 len(candidates),
             )
-            try:
-                from tax_enricher import lookup_parcel_addresses
-
-                lookup_parcel_addresses(notices)
-            except ImportError:
-                logger.warning("  tax_enricher not available — skipping")
-            except Exception as e:
-                logger.warning("  Parcel address lookup failed: %s", e)
+            for county_key, group in by_county.items():
+                if county_key == "knox":
+                    try:
+                        from tax_enricher import lookup_parcel_addresses
+                        lookup_parcel_addresses(group)
+                    except ImportError:
+                        logger.warning("  [Knox] tax_enricher not available — skipping")
+                    except Exception as e:
+                        logger.warning("  [Knox] Parcel address lookup failed: %s", e)
+                elif county_key == "jefferson":
+                    try:
+                        from kentucky_pva_lookup import lookup_parcel_addresses as _ky_parcel_lookup
+                        _ky_parcel_lookup(group)
+                    except ImportError:
+                        logger.warning("  [Jefferson] kentucky_pva_lookup not available — skipping")
+                    except Exception as e:
+                        logger.warning("  [Jefferson] PVA parcel lookup failed: %s", e)
+                else:
+                    logger.info(
+                        "  [%s] %d parcel(s) — no parcel-lookup backend configured",
+                        county_key.title(), len(group),
+                    )
         else:
             logger.info("── Step 4: Parcel Address Lookup (no candidates) ──")
     elif opts.skip_parcel_lookup:
@@ -546,6 +822,94 @@ def run_enrichment_pipeline(
         )
     elif opts.skip_obituary:
         logger.info("── Step 9: Obituary (skipped) ──")
+
+    # ── Step 9c: PVA Maiden Retry (Phase 2a, post-obituary) ──────────
+    # Closes the obituary->PVA maiden bridge. Step 3d runs PVA BEFORE Step 9
+    # (obituary), so on the first pass PVA has no maiden context and a property
+    # titled under a maiden/prior surname (Jackson -> GREATHOUSE: 0 rows under
+    # the married name) cannot resolve. Now that obituary has populated
+    # notice.decedent_obit_maiden_name, re-run the PVA probate lookup ONLY for
+    # the subset where obituary just found a maiden name AND PVA's first pass
+    # still left the address empty. probate_property_lookup re-reads the maiden
+    # context via getattr, so generate_variants now emits + searches the
+    # maiden_obit variant. Gated to the eligible subset (no maiden found, or
+    # already resolved -> skipped entirely). Per-county dispatch like Step 3d.
+    maiden_retry = [
+        n for n in notices
+        if n.notice_type == "probate"
+        and not n.address.strip()
+        and (n.decedent_obit_maiden_name.strip()
+             or n.decedent_obit_prior_surnames.strip())
+    ]
+    if maiden_retry:
+        logger.info(
+            "── Step 9c: PVA Maiden Retry (%d candidate(s)) ──", len(maiden_retry)
+        )
+        by_county = {}
+        for n in maiden_retry:
+            by_county.setdefault(n.county.lower(), []).append(n)
+        for county_key, group in by_county.items():
+            if county_key == "jefferson":
+                try:
+                    from kentucky_pva_lookup import probate_property_lookup as _ky_probate_lookup
+                    _ky_probate_lookup(group)
+                    found = sum(1 for n in group if n.address.strip())
+                    logger.info(
+                        "  [Jefferson] Maiden-retry property address found: %d/%d",
+                        found, len(group),
+                    )
+                except ImportError:
+                    logger.warning("  [Jefferson] kentucky_pva_lookup not available — skipping")
+                except Exception as e:
+                    logger.warning("  [Jefferson] PVA maiden retry failed: %s", e)
+            else:
+                logger.info(
+                    "  [%s] %d record(s) — maiden retry only wired for Jefferson",
+                    county_key.title(), len(group),
+                )
+
+    # ── Step 9.5: No-probate / unknown-heir branch (Phase 6 COVER-02) ─
+    # Runs AFTER the obituary step (Step 9 / 9c) so owner_deceased is set and any
+    # obituary heirs are already on the notice (heir_map_json / decision_maker_*),
+    # and BEFORE Step 9b validation. Deaths that surfaced with NO usable CourtNet
+    # party graph — a Warning-Order-Attorney, or 0 parties (McGarvey tax-foreclosure,
+    # Walker intestate, Combs/Cooper/Dorsey/Gonzalez/Herflicker/Rutter/Spencer/
+    # Thompson-Hale) — would otherwise be DROPPED with no DM. Instead route them to
+    # the shared heir_identifier.identify_heirs waterfall (obituary-off-notice →
+    # affidavit-of-descent → deed-grantor → Phase-1 people-search) and write the
+    # candidates into heir_map_json so the existing skip-trace (Phase 5) + report
+    # paths consume them unchanged. Normal probate (a real executor-filled DM) is
+    # NOT touched: no_usable_party_graph requires a blank owner_name (T-06-10), and
+    # candidates already carrying heirs are skipped.
+    if not opts.skip_heir_verification:
+        try:
+            _run_no_probate_branch(notices)
+        except ImportError as e:
+            logger.warning(
+                "── Step 9.5: No-probate branch unavailable (%s) — skipping ──", e
+            )
+        except Exception as e:  # best-effort: never abort enrichment
+            logger.warning("── Step 9.5: No-probate branch failed: %s ──", e)
+    else:
+        logger.info("── Step 9.5: No-probate branch (skipped) ──")
+
+    # ── Step 9d: Wholesale-Fit Gate (final enrichment step) ──────────
+    # Runs AFTER all enrichment that feeds the score (Zillow value @Step 8,
+    # obituary/DM @Step 9, PVA maiden-retry address @Step 9c) and BEFORE
+    # validation, mirroring the vacant/entity/commercial filter blocks. Every
+    # surviving record now carries wholesale_fit_score + fit_drop_reason; hard
+    # fails are excluded from the list handed to paid skip trace (locked
+    # decision 1 — soft demotes stay, the gate only governs PAID trace).
+    if not opts.skip_fit_filter:
+        logger.info("── Step 9d: Wholesale-Fit Gate ──")
+        before = len(notices)
+        notices = _filter_fit(notices)
+        logger.info("  %d records after fit gate", len(notices))
+        if not notices:
+            logger.warning("No records remaining after fit gate")
+            return notices
+    else:
+        logger.info("── Step 9d: Wholesale-Fit Gate (skipped) ──")
 
     # ── Step 9b: Data Validation ────────────────────────────────────
     logger.info("── Step 9b: Data Validation ──")

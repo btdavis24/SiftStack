@@ -7,6 +7,9 @@ input_foreclosure_daily.json
 last_run.json
 seen_ids.json
 captcha_failed_ids.json
+kcoj_seen_cases.json
+jcd_seen_instruments.json
+kcoj_repoll_queue.json
 .ancestry_page_loads.json
 cookies.json
 datasift_cookies.json
@@ -63,3 +66,13 @@ _brand_tmp/
 _tmp_skill/
 autoresearch/
 .pytest_cache/
+
+# Personal research scratch (contains target PII — keep local only)
+tmp_research/
+scripts/dp_*.py
+scripts/find_bowling*.py
+scripts/find_harkins*.py
+scripts/dump_kcoj_today.py
+
+# DataSift UI captures (contain customer PII visible in records list)
+datasift_*.png

@@ -2,7 +2,11 @@
 
 Runs as either:
   - Apify Actor (when APIFY_IS_AT_HOME is set — reads input from Actor.get_input())
-  - Standalone CLI (python src/main.py daily --counties Knox --types foreclosure)
+  - Standalone CLI (e.g. ``python src/main.py daily --counties Knox,Jefferson``)
+
+Supports both target markets:
+  - TN: Knox, Blount counties (Knoxville/Maryville metro)
+  - KY: Jefferson county (Louisville metro)
 """
 
 import argparse
@@ -51,10 +55,12 @@ def _filter_searches(
 # ── Preflight health checks ─────────────────────────────────────────
 
 
-def _preflight_check(mode: str) -> list[str]:
+def _preflight_check(mode: str, active_searches: list | None = None) -> list[str]:
     """Verify required API keys and service connectivity before running.
 
     Returns a list of failure descriptions. Empty list = all checks passed.
+    active_searches: the filtered search list for this run. If None, all
+                     SAVED_SEARCHES are used (conservative — may over-require creds).
     """
     failures: list[str] = []
 
@@ -64,10 +70,16 @@ def _preflight_check(mode: str) -> list[str]:
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
     if mode in scrape_modes:
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
-        if not config.CAPTCHA_API_KEY:
-            failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
+        # Only TNPN searches require TNPN creds + 2Captcha.
+        # JCD (Jefferson County Deeds) uses plain HTTP; KCOJ (Kentucky Court of
+        # Justice dockets) uses Playwright but needs no login/CAPTCHA.
+        searches_to_check = active_searches if active_searches is not None else list(config.SAVED_SEARCHES)
+        has_tnpn = any(getattr(s, "source", "tnpn") == "tnpn" for s in searches_to_check)
+        if has_tnpn:
+            if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
+                failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
+            if not config.CAPTCHA_API_KEY:
+                failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
 
     if mode in enrichment_modes:
         # These are warnings, not blockers — pipeline degrades gracefully
@@ -90,8 +102,14 @@ def _preflight_check(mode: str) -> list[str]:
         if not config.TRESTLE_API_KEY:
             failures.append("TRESTLE_API_KEY not set (required for phone validation)")
 
-    # ── Connectivity checks (only for scrape modes) ─────────────────
-    if mode in scrape_modes:
+    # ── Connectivity checks (only for TNPN scrape modes) ────────────
+    # Reuse `has_tnpn` from the credential block above. Only run if that block
+    # executed (i.e., mode is a scrape mode); otherwise fall back to False.
+    has_tnpn = mode in scrape_modes and any(
+        getattr(s, "source", "tnpn") == "tnpn"
+        for s in (active_searches if active_searches is not None else list(config.SAVED_SEARCHES))
+    )
+    if mode in scrape_modes and has_tnpn:
         import requests as _requests
         try:
             resp = _requests.head(config.BASE_URL, timeout=10, allow_redirects=True)
@@ -101,7 +119,7 @@ def _preflight_check(mode: str) -> list[str]:
             failures.append(f"Cannot reach tnpublicnotice.com: {e}")
 
     # ── 2Captcha balance check ──────────────────────────────────────
-    if mode in scrape_modes and config.CAPTCHA_API_KEY:
+    if mode in scrape_modes and has_tnpn and config.CAPTCHA_API_KEY:
         import requests as _requests
         try:
             resp = _requests.get(
@@ -311,6 +329,28 @@ async def actor_main() -> None:
             seen_ids = await kvs.get_value("seen_notice_ids") or {}
             Actor.log.info("Loaded %d previously-seen notice IDs from KVS", len(seen_ids))
 
+            # ── Load KCOJ seen-case cache from KVS (independent from TNPN seen_ids) ──
+            # KCOJ dockets recur probate cases across many days; without this,
+            # the daily scheduled Apify run would resend every still-open case
+            # to DataSift every morning.
+            kcoj_seen_cases = await kvs.get_value("kcoj_seen_cases") or {}
+            Actor.log.info("Loaded %d previously-seen KCOJ case numbers from KVS", len(kcoj_seen_cases))
+
+            # ── Load JCD lis-pendens seen-instrument cache from KVS ────────────
+            # Mirrors kcoj_seen_cases exactly. JCD lis pendens recur in the
+            # rolling daily window; without this, the daily scheduled Apify run
+            # would resend every still-open instrument to DataSift every morning
+            # (and re-pay the PDF/OCR cost). KVS is the cloud source of truth.
+            jcd_seen = await kvs.get_value("jcd_seen_instruments") or {}
+            Actor.log.info("Loaded %d previously-seen JCD instruments from KVS", len(jcd_seen))
+
+            # ── Load re-poll queue from KVS (Phase 6 / COVER-01) ──────────────
+            # Mirrors kcoj_seen_cases exactly. Fresh 0-row leads (CourtNet 0 parties /
+            # obituary not posted) + Phase 5's credits-exhausted records are enqueued
+            # here and re-searched at the START of a later run (drain in scraper.py).
+            kcoj_repoll_queue = await kvs.get_value("kcoj_repoll_queue") or {}
+            Actor.log.info("Loaded %d re-poll queue entries from KVS", len(kcoj_repoll_queue))
+
             async def persist_seen_ids(ids: dict) -> None:
                 """Mid-run persistence — if a later search crashes, progress is kept."""
                 try:
@@ -322,6 +362,24 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Failed to persist seen_notice_ids to KVS: %s", e)
 
+            async def persist_kcoj_seen_cases(cases: dict) -> None:
+                try:
+                    await kvs.set_value("kcoj_seen_cases", cases)
+                except Exception as e:
+                    Actor.log.warning("Failed to persist kcoj_seen_cases to KVS: %s", e)
+
+            async def persist_jcd_seen(seen: dict) -> None:
+                try:
+                    await kvs.set_value("jcd_seen_instruments", seen)
+                except Exception as e:
+                    Actor.log.warning("Failed to persist jcd_seen_instruments to KVS: %s", e)
+
+            async def persist_kcoj_repoll_queue(queue: dict) -> None:
+                try:
+                    await kvs.set_value("kcoj_repoll_queue", queue)
+                except Exception as e:
+                    Actor.log.warning("Failed to persist kcoj_repoll_queue to KVS: %s", e)
+
             # ── Scrape ────────────────────────────────────────────────
             notices = await scrape_all(
                 mode=mode, searches=searches, proxy_url=proxy_url, on_batch=push_batch,
@@ -329,7 +387,13 @@ async def actor_main() -> None:
                 llm_api_key=config.ANTHROPIC_API_KEY or None,
                 start_page=start_page,
                 seen_ids=seen_ids,
+                kcoj_seen_cases=kcoj_seen_cases,
                 on_search_complete=persist_seen_ids,
+                on_kcoj_search_complete=persist_kcoj_seen_cases,
+                repoll_queue=kcoj_repoll_queue,
+                on_repoll_complete=persist_kcoj_repoll_queue,
+                jcd_seen=jcd_seen,
+                on_jcd_search_complete=persist_jcd_seen,
             )
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
@@ -366,14 +430,39 @@ async def actor_main() -> None:
             # (deceased owners, heir maps, decision makers). Basic records
             # get skip traced for free inside DataSift's unlimited plan.
             tracerfy_stats = None
+            repoll_queued = 0  # credits-exhausted records queued for Phase 6 re-poll (2g-6)
+
+            # ── Additive fit-gate safety (2g-5 coordination) ──────────────
+            # Phase 4 04-02 OWNS the PRIMARY candidate fit gate below. This thin,
+            # idempotent helper is a defensive NO-OP: True (never filters) when
+            # the fit machinery is absent OR a record is unscored, matching
+            # Phase 4's verdict when scores are present — never double-applies.
+            def _passes_fit_gate(n) -> bool:
+                thr = getattr(config, "SKIP_TRACE_MIN_FIT", None)
+                score = getattr(n, "wholesale_fit_score", None)
+                if thr is None or score in (None, "", 0):  # fit machinery absent → don't filter
+                    return True
+                try:
+                    return int(score) >= int(thr)
+                except (TypeError, ValueError):
+                    return True
+
             if do_tracerfy and config.TRACERFY_API_KEY:
+                # Fit gate (Phase 4): paid Tracerfy runs only on records at/above
+                # SKIP_TRACE_MIN_FIT, keeping the deceased/DM condition as a
+                # SECONDARY requirement. Parse wholesale_fit_score defensively so an
+                # unscored/blank record fails CLOSED (scores 0 → excluded), never
+                # crashing the gate.
                 dp_for_tracerfy = [
                     n for n in notices
-                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
+                    if (int(n.wholesale_fit_score or 0) >= config.SKIP_TRACE_MIN_FIT)
+                    and (n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name)
                 ]
+                # Defensive no-op on top of Phase 4's gate (no double-apply).
+                dp_for_tracerfy = [n for n in dp_for_tracerfy if _passes_fit_gate(n)]
                 if dp_for_tracerfy:
-                    Actor.log.info("Running Tracerfy on %d DP candidates (%d basic records skipped)...",
-                                   len(dp_for_tracerfy), total - len(dp_for_tracerfy))
+                    Actor.log.info("Running Tracerfy on %d fit DP candidates (>= SKIP_TRACE_MIN_FIT %d; %d records skipped)...",
+                                   len(dp_for_tracerfy), config.SKIP_TRACE_MIN_FIT, total - len(dp_for_tracerfy))
                     try:
                         from tracerfy_skip_tracer import batch_skip_trace
                         tracerfy_stats = batch_skip_trace(dp_for_tracerfy)
@@ -383,8 +472,62 @@ async def actor_main() -> None:
                             tracerfy_stats["phones_found"], tracerfy_stats["emails_found"],
                             tracerfy_stats["cost"],
                         )
+                        # Salvage a credits-exhausted batch: phone-less records get
+                        # repoll_after set so Phase 6 re-polls them (2g-6, T-05-11).
+                        if tracerfy_stats.get("credits_exhausted"):
+                            Actor.log.error(
+                                "TRACERFY OUT OF CREDITS — remainder queued for re-poll."
+                            )
+                            try:
+                                from skip_trace_guard import handle_credits_exhausted
+                                ce = handle_credits_exhausted(dp_for_tracerfy, tracerfy_stats)
+                                repoll_queued = ce.get("queued", 0)
+                            except Exception as ce_e:
+                                Actor.log.warning("Credits-exhausted re-poll enqueue failed: %s", ce_e)
                     except Exception as e:
                         Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
+
+                    # ── Death/identity guard + empty-trace fallback (2g-3/2g-4) ──
+                    # Runs STRICTLY BETWEEN batch_skip_trace (above) and Trestle
+                    # score_record_phones (below) on the SAME Phase-4 fit-gated
+                    # list — dead/wrong-person phones are suppressed before they
+                    # can be scored or dialed (T-05-08).
+                    try:
+                        from skip_trace_guard import guard_all, apply_contact_fallbacks
+                        g_stats = guard_all(dp_for_tracerfy)
+                        fb_stats = apply_contact_fallbacks(dp_for_tracerfy)
+                        Actor.log.info(
+                            "Guard: %d phone(s) suppressed, %d DM(s) unconfirmed; "
+                            "fallback: %d via attorney, %d queued for AOC-805",
+                            g_stats["suppressed_phones"], g_stats["unconfirmed"],
+                            fb_stats["attorney"], fb_stats["aoc805_queued"],
+                        )
+                    except Exception as e:
+                        Actor.log.warning("Skip-trace guard/fallback failed: %s — continuing", e)
+
+                    # ── Phase 5→6 bridge (BLOCKER-2) ──────────────────────────
+                    # Phase 5's 2g-6 (handle_credits_exhausted) + AOC-805 fallback set
+                    # notice.repoll_after on a FIELD; copy those into the
+                    # kcoj_repoll_queue DICT so the NEXT run's drain re-searches them.
+                    # Reuses the already-built dp_for_tracerfy list; idempotent on an
+                    # existing key; re-persists to KVS so the queue survives the run.
+                    try:
+                        from kcoj_repoll_queue import enqueue_repoll, make_key, save_repoll_queue
+                        bridged = 0
+                        for n in dp_for_tracerfy:
+                            if getattr(n, "repoll_after", "").strip():
+                                k = make_key(n)
+                                if k:
+                                    enqueue_repoll(kcoj_repoll_queue, k, reason="credits_exhausted")
+                                    bridged += 1
+                        save_repoll_queue(kcoj_repoll_queue)
+                        await kvs.set_value("kcoj_repoll_queue", kcoj_repoll_queue)
+                        Actor.log.info(
+                            "Phase 5→6 bridge: enqueued %d repoll_after notice(s) into kcoj_repoll_queue",
+                            bridged,
+                        )
+                    except Exception as e:
+                        Actor.log.warning("Re-poll bridge failed: %s — continuing", e)
                 else:
                     Actor.log.info("No DP candidates — Tracerfy skipped (0 deceased/DM records)")
             elif do_tracerfy:
@@ -406,7 +549,10 @@ async def actor_main() -> None:
             if dp_candidates and config.TRESTLE_API_KEY:
                 try:
                     from phone_validator import score_record_phones
-                    phone_tiers = score_record_phones(dp_candidates, config.TRESTLE_API_KEY)
+                    # litigator risk matters for probate cold outreach (2g-5)
+                    phone_tiers = score_record_phones(
+                        dp_candidates, config.TRESTLE_API_KEY, add_litigator=True,
+                    )
                     Actor.log.info("Trestle scored %d unique phones across DP candidates",
                                    len(phone_tiers))
                 except Exception as e:
@@ -523,6 +669,15 @@ async def actor_main() -> None:
                         cost_breakdown=cost_breakdown,
                     )
 
+                    # Surface the credits-exhausted re-poll count (2g-6) so the
+                    # Slack run summary reflects deferred coverage when Tracerfy
+                    # ran out of credits mid-run.
+                    if repoll_queued:
+                        _send_webhook(
+                            f"Tracerfy credits exhausted — {repoll_queued} records "
+                            f"queued for re-poll (Phase 6 will re-trace)"
+                        )
+
                     # Send DataSift CSV download links as a follow-up message
                     if datasift_csv_urls:
                         csv_lines = [
@@ -547,13 +702,22 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
 
-            # ── Save last_run_date + seen_notice_ids to Apify KVS for next run ─────
+            # ── Save last_run_date + seen_notice_ids + kcoj_seen_cases + jcd_seen_instruments to KVS ─────
             await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
             await kvs.set_value("seen_notice_ids", seen_ids)
+            await kvs.set_value("kcoj_seen_cases", kcoj_seen_cases)
+            await kvs.set_value("jcd_seen_instruments", jcd_seen)
             Actor.log.info(
-                "Saved last_run_date + %d seen_notice_ids to KVS for next daily run",
-                len(seen_ids),
+                "Saved last_run_date + %d seen_notice_ids + %d kcoj_seen_cases + %d jcd_seen_instruments to KVS for next run",
+                len(seen_ids), len(kcoj_seen_cases), len(jcd_seen),
             )
+
+            if repoll_queued:
+                Actor.log.warning(
+                    "Tracerfy credits exhausted — %d records queued for re-poll "
+                    "(repoll_after set; Phase 6 will re-trace)",
+                    repoll_queued,
+                )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
 
@@ -987,7 +1151,8 @@ def _run_manage_sold(args) -> None:
     """Run the SiftMap sold properties management workflow."""
     from datasift_uploader import run_manage_sold_workflow
 
-    # Parse counties if provided, otherwise use default (Knox, Blount)
+    # Parse counties if provided, otherwise the workflow uses its built-in
+    # default (Knox + Blount + Jefferson).
     counties = None
     if args.counties and args.counties.lower() != "all":
         counties = [c.strip().title() for c in args.counties.split(",")]
@@ -1020,8 +1185,9 @@ def cli_main() -> None:
             "csv-import", "phone-validate", "manage-sold", "manage-presets",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
+            "buyer-prospect-jefferson",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
-            "playbook",
+            "playbook", "disposition",
         ],
         help=(
             "daily/historical = scrape notices; pdf-import/photo-import = import from files; "
@@ -1031,14 +1197,16 @@ def cli_main() -> None:
             "analyze-deal = full deal analysis; market-analysis = zip code scoring; "
             "buyer-prospect = cash buyer lists; deep-prospect = 4-level research; "
             "lead-manage = 4 Pillars qualification; setup-sequences = CRM automation; "
-            "niche-sequential = marketing cycle; playbook = SOP generator"
+            "niche-sequential = marketing cycle; playbook = SOP generator; "
+            "disposition = 1-page wholesale flyer (PVA + Drive photos)"
         ),
     )
     parser.add_argument(
         "--counties",
         type=str,
         default=None,
-        help='Comma-separated counties to scrape (e.g. "Knox,Blount" or "all")',
+        help='Comma-separated counties to scrape (e.g. "Knox,Blount,Jefferson" or "all"). '
+             'TN: Knox, Blount. KY: Jefferson.',
     )
     parser.add_argument(
         "--types",
@@ -1257,7 +1425,7 @@ def cli_main() -> None:
     parser.add_argument(
         "--no-skip-trace",
         action="store_true",
-        help="Skip DataSift skip trace after upload",
+        help="Skip DataSift skip trace after upload (also suppresses Tracerfy in deep-prospect)",
     )
     parser.add_argument(
         "--notify-slack",
@@ -1296,7 +1464,8 @@ def cli_main() -> None:
     parser.add_argument(
         "--no-upload",
         action="store_true",
-        help="Skip uploading phone tags back to DataSift (phone-validate mode)",
+        help="Skip upload step — phone-validate: don't push tags back to DataSift; "
+             "disposition: build PDF locally without uploading to Drive",
     )
     parser.add_argument(
         "--custom-tiers",
@@ -1365,12 +1534,35 @@ def cli_main() -> None:
                         help="Property address (comp/rehab/analyze-deal modes)")
     parser.add_argument("--city", type=str, default=None,
                         help="Property city (comp/rehab/analyze-deal modes)")
+    parser.add_argument("--state", type=str, default=None,
+                        help="Property state, 2-letter (comp/rehab/analyze-deal modes, default: TN)")
     parser.add_argument("--zip-code", type=str, default=None,
                         help="Property ZIP code (comp/rehab/analyze-deal modes)")
     parser.add_argument("--radius", type=float, default=0.5,
                         help="Comp search radius in miles (comp mode, default: 0.5)")
     parser.add_argument("--months", type=int, default=6,
                         help="Comp lookback months (comp mode, default: 6)")
+    # Subject overrides for comp mode — use when Zillow's reso facts are stale
+    parser.add_argument("--subject-beds", type=int, default=None,
+                        help="Override Zillow's bedroom count for subject (comp mode)")
+    parser.add_argument("--subject-baths", type=float, default=None,
+                        help="Override Zillow's bathroom count for subject (comp mode)")
+    parser.add_argument("--subject-sqft", type=int, default=None,
+                        help="Override Zillow's total sqft for subject (comp mode)")
+    parser.add_argument("--subject-ag", type=int, default=None,
+                        help="Subject above-grade sqft (comp mode) — needed if different from total")
+    parser.add_argument("--subject-bg", type=int, default=None,
+                        help="Subject below-grade finished sqft (comp mode) — often missing from Zillow")
+    parser.add_argument("--subject-year", type=int, default=None,
+                        help="Override Zillow's year built for subject (comp mode)")
+    parser.add_argument("--subject-lot", type=int, default=None,
+                        help="Override Zillow's lot sqft for subject (comp mode)")
+    parser.add_argument("--subject-garage", type=int, default=None,
+                        help="Override Zillow's garage stall count for subject (comp mode)")
+    parser.add_argument("--target-condition", type=str, default="full",
+                        help="Subject's target post-rehab condition — as-is/light/full (comp mode)")
+    parser.add_argument("--condition-file", type=str, default="data/condition_overrides.csv",
+                        help="CSV of zpid/address → condition labels (comp mode)")
 
     # Rehab estimation
     parser.add_argument("--tier", type=int, default=2, choices=[1, 2, 3, 4],
@@ -1404,6 +1596,18 @@ def cli_main() -> None:
     # Buyer prospecting
     parser.add_argument("--min-transactions", type=int, default=2,
                         help="Min transactions to qualify as investor (buyer-prospect mode)")
+
+    # Buyer prospect — Jefferson KY (DataSift Sold Properties scrape)
+    parser.add_argument("--start", type=str, default=None,
+                        help="Start month YYYY-MM (buyer-prospect-jefferson mode)")
+    parser.add_argument("--end", type=str, default=None,
+                        help="End month YYYY-MM (buyer-prospect-jefferson mode). "
+                             "If --start/--end omitted, uses --months-back (default 12).")
+    parser.add_argument("--include-deeds", action="store_true",
+                        help="Cross-reference DataSift buyers against Jefferson County "
+                             "Clerk deed records (Phase 1B). Adds 'Deeds Found' column "
+                             "to scorecard + 'Deed-Only Buyers' tab. Adds ~5 min to the "
+                             "scrape for a 12-month window.")
 
     # Deep prospecting
     parser.add_argument("--depth", type=int, default=3, choices=[1, 2, 3, 4],
@@ -1441,6 +1645,21 @@ def cli_main() -> None:
     parser.add_argument("--team-size", type=int, default=1,
                         help="Team size 1/2/5 (playbook mode)")
 
+    # Disposition flyer
+    parser.add_argument("--asking", type=str, default="",
+                        help="Asking price (number or text like 'Make Offer'; disposition mode)")
+    parser.add_argument("--arv", type=str, default="",
+                        help="ARV (number or text like '$360,000+'; disposition mode)")
+    parser.add_argument("--year-built", type=str, default="",
+                        help="Year built (disposition mode — overrides PVA value)")
+    parser.add_argument("--acreage", type=float, default=0.0,
+                        help="Acreage (disposition mode — overrides PVA value)")
+    parser.add_argument("--additional-info", type=str, default="",
+                        help="Bullet items for the Additional Info card; "
+                             "separate with ';' (e.g. 'Vacant; Cash close; Sold AS-IS')")
+    parser.add_argument("--non-interactive", action="store_true",
+                        help="Skip interactive prompts (disposition mode — fail if PVA misses fields)")
+
     args = parser.parse_args()
 
     # Apply LLM backend override from CLI flag
@@ -1455,7 +1674,24 @@ def cli_main() -> None:
     setup_logging(args.verbose)
 
     # ── Preflight health checks ──────────────────────────────────────
-    preflight_failures = _preflight_check(args.mode)
+    _counties = [c.strip() for c in args.counties.split(",")] if args.counties else None
+    _types = [t.strip() for t in args.types.split(",")] if getattr(args, "types", None) else None
+    _active_searches = _filter_searches(_counties, _types)
+
+    # Auto-enable Slack notification whenever the resolved run includes the
+    # lis pendens scrape so the JCD scrape always pings on completion without
+    # the operator having to remember --notify-slack. Covers explicit
+    # --types lis_pendens, unfiltered runs, and --counties-only filters.
+    # Both the empty-results and full-results paths at the bottom of
+    # run_pipeline gate on args.notify_slack.
+    if (
+        any(s.notice_type == "lis_pendens" for s in _active_searches)
+        and not getattr(args, "notify_slack", False)
+    ):
+        args.notify_slack = True
+        logging.info("Auto-enabled Slack notification for lis_pendens run")
+
+    preflight_failures = _preflight_check(args.mode, active_searches=_active_searches)
     if preflight_failures:
         for f in preflight_failures:
             logging.error("Preflight FAILED: %s", f)
@@ -1475,16 +1711,32 @@ def cli_main() -> None:
             print("ERROR: --address is required for comp mode")
             return
         from comp_analyzer import run_comp_analysis
+        overrides = {}
+        if args.subject_beds is not None: overrides["beds"] = args.subject_beds
+        if args.subject_baths is not None: overrides["baths"] = args.subject_baths
+        if args.subject_sqft is not None: overrides["sqft"] = args.subject_sqft
+        if args.subject_ag is not None: overrides["ag_sqft"] = args.subject_ag
+        if args.subject_bg is not None: overrides["bg_sqft"] = args.subject_bg
+        if args.subject_year is not None: overrides["year_built"] = args.subject_year
+        if args.subject_lot is not None: overrides["lot_sqft"] = args.subject_lot
+        if args.subject_garage is not None: overrides["garage"] = args.subject_garage
         result = run_comp_analysis(
-            address=args.address, city=args.city or "", zip_code=args.zip_code or "",
-            radius=args.radius, months=args.months,
+            address=args.address, city=args.city or "", state=args.state or "TN",
+            zip_code=args.zip_code or "", radius=args.radius, months=args.months,
+            subject_overrides=overrides or None,
+            target_condition=args.target_condition,
+            condition_file=args.condition_file,
         )
         if "error" in result:
             logger.error("Comp analysis failed: %s", result["error"])
         else:
-            print(f"Comp report: {result['report_path']}")
+            print(f"Comp report (Excel): {result['report_path']}")
+            if result.get("pdf_path"):
+                print(f"Comp report (PDF):   {result['pdf_path']}")
             arv = result["arv"]
             print(f"ARV: ${arv.arv_low:,.0f} (low) / ${arv.arv_mid:,.0f} (mid) / ${arv.arv_high:,.0f} (high)")
+            if arv.sentiment_adj_pct:
+                print(f"Market phase: {arv.market_phase} (DOM {arv.market_dom_avg}d) → {arv.sentiment_adj_pct:+.0%} sentiment adj")
             print(f"Confidence: {arv.confidence} — {arv.confidence_reason}")
         return
 
@@ -1562,6 +1814,49 @@ def cli_main() -> None:
             print(f"CSV: {result.get('csv_path', 'N/A')}")
         return
 
+    if args.mode == "buyer-prospect-jefferson":
+        import asyncio
+        from jefferson_buyer_prospector import run_jefferson_buyer_prospecting
+        # If user didn't pass --start/--end, default --months-back to 12
+        # for this mode (the generic flag defaults to 1, which is wrong here).
+        months_back = args.months_back if args.months_back != 1 else 12
+        result = asyncio.run(run_jefferson_buyer_prospecting(
+            start_month=args.start,
+            end_month=args.end,
+            months_back=months_back,
+            include_deeds=getattr(args, "include_deeds", False),
+        ))
+        if "error" in result:
+            logger.error("Jefferson buyer prospecting failed: %s", result["error"])
+        else:
+            print(f"Excel:        {result['excel']}")
+            print(f"Raw CSV:      {result['raw_csv']}")
+            print(f"DataSift CSV: {result['datasift_csv']}")
+            main_top = result["main_buyers"][:10]
+            n_builders = len(result["builder_buyers"])
+            print(f"\nTop 10 wholesale-target buyers "
+                  f"({result['start_month']} -> {result['end_month']}, "
+                  f"{n_builders} builders/bulk separated):")
+            for r in main_top:
+                tag = "[Entity]" if r.is_entity else "[Indiv]"
+                print(f"  #{r.rank:2d}  {tag} {r.transaction_count:3d}x  ${r.total_invested:>11,}  {r.buyer_name}")
+            if n_builders:
+                print(f"\nTop builders/bulk acquirers (excluded from main rank):")
+                for r in result["builder_buyers"][:5]:
+                    print(f"  #{r.rank:2d}  {r.transaction_count:3d}x  ${r.total_invested:>11,}  "
+                          f"{r.buyer_name}  [{r.bulk_signal}]")
+            cr = result.get("cross_ref")
+            if cr is not None:
+                print(f"\nJCD deed cross-reference:")
+                print(f"  DataSift verified: {cr.verified_count} / unverified: {cr.unverified_count}")
+                print(f"  Total deeds scanned: {cr.total_deeds:,} ({cr.total_entity_grantees:,} entity grantees)")
+                print(f"  Deed-only buyers DataSift missed: {cr.deed_only_count}")
+                if cr.deed_only_buyers:
+                    print(f"\nTop 10 deed-only entity buyers (NOT in DataSift):")
+                    for b in cr.deed_only_buyers[:10]:
+                        print(f"  #{b.rank:2d}  {b.deed_count:3d}x deeds  {b.first_filing}..{b.last_filing}  {b.buyer_name}")
+        return
+
     if args.mode == "deep-prospect":
         csv_path = args.csv_path if hasattr(args, "csv_path") and args.csv_path else ""
         if not csv_path:
@@ -1575,6 +1870,8 @@ def cli_main() -> None:
         result = asyncio.run(run_deep_prospecting(
             csv_path=csv_path, depth=args.depth,
             max_records=args.max_notices if hasattr(args, "max_notices") else 0,
+            # Phase 5: --no-skip-trace also suppresses Tracerfy in deep-prospect.
+            skip_trace=not getattr(args, "no_skip_trace", False),
         ))
         if "error" in result:
             logger.error("Deep prospecting failed: %s", result["error"])
@@ -1641,6 +1938,36 @@ def cli_main() -> None:
         )
         print(f"Playbook: {result['playbook_path']}")
         print(f"Blueprint: {result['blueprint'].title()} | Market: {result['market'].title()} | Team: {result['team_size']}")
+        return
+
+    if args.mode == "disposition":
+        if not args.address:
+            print("ERROR: --address is required for disposition mode")
+            return
+        if not args.asking or not args.arv:
+            print("ERROR: --asking and --arv are required for disposition mode")
+            return
+        from disposition_flyer import run_disposition_flyer
+        pdf_path = run_disposition_flyer(
+            address=args.address,
+            city=args.city or "Louisville",
+            state=args.state or "KY",
+            zip_code=args.zip_code or "",
+            asking_price=args.asking,
+            arv=args.arv,
+            bedrooms=args.bedrooms or 0,
+            bathrooms=args.bathrooms or 0.0,
+            sqft=args.sqft or 0,
+            year_built=args.year_built or "",
+            acreage=args.acreage or 0.0,
+            additional_info=args.additional_info or "",
+            interactive=not args.non_interactive,
+            skip_upload=args.no_upload,
+        )
+        if pdf_path:
+            print(f"\nFlyer ready: {pdf_path}")
+        else:
+            print("\nFlyer generation failed — check errors above.")
         return
 
     # Phone validation mode — separate pipeline
@@ -1775,22 +2102,105 @@ def _run_scrape_pipeline(args, searches) -> None:
     # Tracerfy batch skip trace (phones + emails for all records)
     tiers_map: dict = {}
     tracerfy_stats: dict = {}
+    repoll_queued: int = 0  # credits-exhausted records queued for Phase 6 re-poll (2g-6)
     if not getattr(args, "skip_tracerfy", False):
         import config as cfg
+
+        # ── Additive fit-gate safety (2g-5 coordination) ──────────────────
+        # Phase 4 04-02 OWNS the PRIMARY candidate fit gate below. This thin,
+        # idempotent helper is a defensive NO-OP: it returns True (never filters)
+        # when the fit machinery is absent OR a record is unscored, and matches
+        # Phase 4's verdict when scores are present — so it NEVER double-applies
+        # and keeps this plan independently shippable.
+        def _passes_fit_gate(n) -> bool:
+            thr = getattr(cfg, "SKIP_TRACE_MIN_FIT", None)
+            score = getattr(n, "wholesale_fit_score", None)
+            if thr is None or score in (None, "", 0):  # fit machinery absent → don't filter
+                return True
+            try:
+                return int(score) >= int(thr)
+            except (TypeError, ValueError):
+                return True
+
         if cfg.TRACERFY_API_KEY:
             from tracerfy_skip_tracer import batch_skip_trace
-            tracerfy_stats = batch_skip_trace(notices)
+            # Fit gate (Phase 4): below-fit leads are not submitted to paid
+            # Tracerfy. Parse wholesale_fit_score defensively so an unscored/blank
+            # record fails CLOSED (scores 0 → excluded), never crashing the gate.
+            trace_candidates = [
+                n for n in notices
+                if int(n.wholesale_fit_score or 0) >= cfg.SKIP_TRACE_MIN_FIT
+            ]
+            # Defensive no-op on top of Phase 4's gate (no double-apply).
+            trace_candidates = [n for n in trace_candidates if _passes_fit_gate(n)]
+            logging.info("Tracerfy fit-gate: %d/%d records >= SKIP_TRACE_MIN_FIT (%d)",
+                         len(trace_candidates), len(notices), cfg.SKIP_TRACE_MIN_FIT)
+            tracerfy_stats = batch_skip_trace(trace_candidates)
             if tracerfy_stats.get("credits_exhausted"):
                 logging.error(
                     "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
                     "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
                 )
+                # Salvage the remainder: phone-less records get repoll_after set
+                # so Phase 6 re-polls them instead of dropping them (2g-6, T-05-11).
+                try:
+                    from skip_trace_guard import handle_credits_exhausted
+                    ce = handle_credits_exhausted(trace_candidates, tracerfy_stats)
+                    repoll_queued = ce.get("queued", 0)
+                except Exception as e:
+                    logging.warning("Credits-exhausted re-poll enqueue failed: %s", e)
             logging.info(
                 "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
                 tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
                 tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
                 tracerfy_stats.get("cost", 0.0),
             )
+
+            # ── Death/identity guard + empty-trace fallback (2g-3/2g-4) ──
+            # Runs STRICTLY BETWEEN batch_skip_trace (above) and Trestle
+            # score_record_phones (below) on the SAME Phase-4 fit-gated
+            # list — dead/wrong-person phones are suppressed before they can
+            # be scored or dialed (T-05-08).
+            try:
+                from skip_trace_guard import guard_all, apply_contact_fallbacks
+                g_stats = guard_all(trace_candidates)
+                fb_stats = apply_contact_fallbacks(trace_candidates)
+                logging.info(
+                    "Guard: %d phone(s) suppressed, %d DM(s) unconfirmed; "
+                    "fallback: %d via attorney, %d queued for AOC-805",
+                    g_stats["suppressed_phones"], g_stats["unconfirmed"],
+                    fb_stats["attorney"], fb_stats["aoc805_queued"],
+                )
+            except Exception as e:
+                logging.warning("Skip-trace guard/fallback failed: %s — continuing", e)
+
+            # ── Phase 5→6 bridge (BLOCKER-2) ──────────────────────────────────
+            # Phase 5's 2g-6 (handle_credits_exhausted) + AOC-805 fallback set
+            # notice.repoll_after on a FIELD; copy those into the kcoj_repoll_queue
+            # DICT so the NEXT run's drain re-searches them. CLI is file-backed:
+            # load the same KCOJ_REPOLL_FILE the start-of-next-run drain reads,
+            # enqueue, and save. Reuses the already-built trace_candidates list;
+            # idempotent on an existing key.
+            try:
+                from kcoj_repoll_queue import (
+                    enqueue_repoll, make_key, load_repoll_queue, save_repoll_queue,
+                )
+                bridge_q = load_repoll_queue()
+                bridged = 0
+                for n in trace_candidates:
+                    if getattr(n, "repoll_after", "").strip():
+                        k = make_key(n)
+                        if k:
+                            enqueue_repoll(bridge_q, k, reason="credits_exhausted")
+                            bridged += 1
+                save_repoll_queue(bridge_q)
+                logging.info(
+                    "Phase 5→6 bridge: enqueued %d repoll_after notice(s) into kcoj_repoll_queue",
+                    bridged,
+                )
+            except Exception as e:
+                logging.warning("Re-poll bridge failed: %s — continuing", e)
+
             # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
             # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
             if cfg.TRESTLE_API_KEY:
@@ -1801,7 +2211,10 @@ def _run_scrape_pipeline(args, searches) -> None:
                 ]
                 if dp_cands:
                     try:
-                        tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
+                        # litigator risk matters for probate cold outreach (2g-5)
+                        tiers_map = score_record_phones(
+                            dp_cands, cfg.TRESTLE_API_KEY, add_litigator=True,
+                        )
                         logging.info("Trestle scored %d unique phones across %d DP records",
                                      len(tiers_map), len(dp_cands))
                     except Exception as e:
@@ -1885,11 +2298,41 @@ def _run_scrape_pipeline(args, searches) -> None:
         else:
             logging.error("DataSift upload failed: %s", upload_result.get("message"))
 
+        # Phonebook CSV — write whenever any record has Tracerfy phone data.
+        # Gives DataSift phones for records its own skip trace provider skips.
+        records_with_phones = [n for n in notices if n.primary_phone or n.mobile_1 or n.landline_1]
+        if records_with_phones:
+            from datasift_phonebook_formatter import write_phonebook_csv
+            pb_path = write_phonebook_csv(notices)
+            logging.info("Phonebook CSV (%d records): %s", len(records_with_phones), pb_path)
+
+    # Run-summary surfacing for the credits-exhausted re-poll queue (2g-6).
+    # If Tracerfy ran out of credits mid-run, the phone-less remainder was
+    # queued (repoll_after set) for Phase 6 instead of being dropped — report it
+    # in the CLI/Slack run summary so the operator sees the deferred coverage.
+    if repoll_queued:
+        logging.warning(
+            "Tracerfy credits exhausted — %d records queued for re-poll "
+            "(repoll_after set; Phase 6 will re-trace)",
+            repoll_queued,
+        )
+
     # Slack/Discord notification
     if getattr(args, "notify_slack", False):
-        from slack_notifier import send_slack_notification
+        from slack_notifier import send_slack_notification, _send_webhook
 
         send_slack_notification(notices, upload_result=upload_result)
+        # Surface the credits-exhausted re-poll count as a follow-up line so the
+        # Slack run summary reflects deferred coverage (2g-6). Done here (not in
+        # slack_notifier) to keep that module out of this plan's scope.
+        if repoll_queued:
+            try:
+                _send_webhook(
+                    f"Tracerfy credits exhausted — {repoll_queued} records "
+                    f"queued for re-poll (Phase 6 will re-trace)"
+                )
+            except Exception as e:
+                logging.warning("Slack re-poll summary line failed: %s", e)
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):

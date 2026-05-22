@@ -1,15 +1,23 @@
 """Core scraping logic — login, navigate saved searches, paginate results."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import random
 import re
 from datetime import datetime, timedelta
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwright
+if TYPE_CHECKING:
+    from playwright.async_api import Page
 
-from captcha_solver import solve_captcha_and_view
+# Playwright symbols loaded lazily by _load_playwright() before any TNPN code path.
+# JCD-only runs never touch these, so the broken greenlet DLL is never loaded.
+PwTimeout: type[Exception] = Exception
+async_playwright = None
+solve_captcha_and_view = None
+
 import config
 from config import (
     BASE_URL,
@@ -41,6 +49,16 @@ from foreclosure_filter import is_valid_foreclosure
 from notice_parser import NoticeData, is_target_county, parse_notice_page
 
 logger = logging.getLogger(__name__)
+
+
+def _load_playwright() -> None:
+    """Inject Playwright symbols into module globals — called once before any TNPN scrape."""
+    global PwTimeout, async_playwright, solve_captcha_and_view
+    from playwright.async_api import TimeoutError as _PwTimeout, async_playwright as _ap
+    from captcha_solver import solve_captcha_and_view as _scav
+    PwTimeout = _PwTimeout
+    async_playwright = _ap
+    solve_captcha_and_view = _scav
 
 
 async def delay() -> None:
@@ -666,6 +684,66 @@ def save_captcha_failed_ids(failed: dict[str, dict]) -> None:
     config.save_state(CAPTCHA_FAILED_IDS_FILE, failed)
 
 
+# ── Re-poll queue drain (Phase 6 / COVER-01, locked decision 2) ──────
+# Drain the re-poll queue at the START of each daily run, BEFORE the new
+# scrape, so re-found cases flow through the SAME enrichment path as fresh
+# ones (one code path). This is a MODULE-LEVEL standalone function (not
+# inlined in scrape_all) so it can be unit-tested directly with a mocked
+# CourtNet and zero network.
+
+
+async def drain_repoll_queue(repoll_queue: dict, page=None) -> list[NoticeData]:
+    """Re-search every DUE re-poll entry at the START of the daily run.
+
+    For each key whose ``repoll_after <= today`` (06-01 ``due_entries``):
+      * reconstruct a minimal probate NoticeData from the key (case_number when
+        the key looks like a docket number, else ``decedent|date``),
+      * re-run the CourtNet party lookup via the SAME ``enrich_case_parties``
+        path used for fresh cases — passing ``repoll_queue=None`` so the drain's
+        own re-search does NOT re-enqueue mid-drain (the drain owns the bump),
+      * on a HIT (owner_name filled OR a non-empty courtnet_party_types), stamp
+        ``repoll_attempts`` from the entry, remove the key, and append the
+        re-found notice to the returned list,
+      * on a still-empty MISS, ``bump_or_drop`` the entry (attempts++ / drop at
+        max with an audit note).
+
+    Returns the re-found notices for ``scrape_all`` to merge into all_notices.
+    The CALLER persists the (mutated) queue. Each per-entry re-search is wrapped
+    in try/except so one bad entry can never abort the run or the rest of the
+    drain (threat T-06-07); a poisoned key yields 0 parties and is bumped/dropped,
+    not amplified (threat T-06-08)."""
+    from kcoj_repoll_queue import due_entries, bump_or_drop
+    from kcoj_case_detail import enrich_case_parties
+    import re as _re
+
+    refound: list[NoticeData] = []
+    due = due_entries(repoll_queue)
+    logger.info("Re-poll queue: %d due / %d total", len(due), len(repoll_queue))
+    for key in list(due):
+        entry = repoll_queue.get(key, {})
+        try:
+            # enrich_case_parties only acts on probate/Jefferson candidates with a
+            # case_number, so reconstruct the minimal shape it filters on.
+            notice = NoticeData(notice_type="probate", county="Jefferson", state="KY")
+            if _re.match(r"\d{2}-[A-Z]{1,3}-\d+", key):
+                notice.case_number = key
+            else:
+                notice.decedent_name = key.split("|", 1)[0]
+            # repoll_queue=None: the drain owns the bump; do NOT re-enqueue mid-drain.
+            await enrich_case_parties([notice], repoll_queue=None)
+            if notice.owner_name.strip() or notice.courtnet_party_types.strip():
+                setattr(notice, "repoll_attempts", str(entry.get("attempts", 0)))
+                repoll_queue.pop(key, None)
+                refound.append(notice)
+                logger.info("Re-poll HIT: %s re-found and merged", key)
+            else:
+                status = bump_or_drop(repoll_queue, key)
+                logger.info("Re-poll miss (%s): %s", status, key)
+        except Exception as e:
+            logger.warning("Re-poll drain error on %s: %s — leaving entry", key, e)
+    return refound
+
+
 # ── Main Entry Point ─────────────────────────────────────────────────
 
 
@@ -680,7 +758,13 @@ async def scrape_all(
     max_notices: int = 0,
     seen_ids: dict[str, str] | None = None,
     captcha_failed_ids: dict[str, dict] | None = None,
+    kcoj_seen_cases: dict[str, str] | None = None,
     on_search_complete=None,
+    on_kcoj_search_complete=None,
+    repoll_queue: dict | None = None,
+    on_repoll_complete=None,
+    jcd_seen: dict[str, str] | None = None,
+    on_jcd_search_complete=None,
 ) -> list[NoticeData]:
     """Main entry point for scraping.
 
@@ -737,6 +821,165 @@ async def scrape_all(
         logger.info("Historical mode: pulling notices since %s", since_date)
 
     all_notices: list[NoticeData] = []
+
+    # ── Re-poll queue drain (Phase 6 / COVER-01, locked decision 2) ─────
+    # Drain the queue at the START of the run, BEFORE the per-source scrape
+    # loop, so re-found cases flow through the SAME downstream enrichment as
+    # fresh ones. Re-found notices are merged FIRST: data_formatter.deduplicate
+    # keeps the most recent, and a re-found case is OLDER than a same-day fresh
+    # dup, so prepending them does not corrupt dedup. Persistence mirrors the
+    # kcoj_seen_cases pattern (local save + KVS callback) and is wrapped in the
+    # same try/except shape so a persist failure cannot abort the run.
+    from kcoj_repoll_queue import load_repoll_queue, save_repoll_queue
+    if repoll_queue is None:
+        repoll_queue = load_repoll_queue()
+    refound = await drain_repoll_queue(repoll_queue)
+    all_notices.extend(refound)
+    try:
+        save_repoll_queue(repoll_queue)
+        if on_repoll_complete is not None:
+            await on_repoll_complete(repoll_queue)
+    except Exception as e:
+        logger.warning("Re-poll queue persist failed: %s", e)
+
+    # ── Split searches by source ───────────────────────────────────────
+    jcd_searches = [s for s in searches if getattr(s, "source", "tnpn") == "jcd"]
+    kcoj_searches = [s for s in searches if getattr(s, "source", "tnpn") == "kcoj"]
+    tnpn_searches = [s for s in searches if getattr(s, "source", "tnpn") == "tnpn"]
+
+    # ── Kentucky Court of Justice daily dockets (Playwright, no login) ─
+    if kcoj_searches:
+        from kcoj_scraper import (
+            scrape_kcoj_dockets,
+            load_kcoj_seen_cases,
+            save_kcoj_seen_cases,
+        )
+
+        # KCOJ has its own cross-run dedup cache (case_number → first_seen),
+        # separate from TNPN's seen_ids (which is notice-URL-keyed). Probate
+        # cases recur on dockets across multiple hearings; without this, a
+        # daily Apify run would resend the same 33 cases every morning.
+        # Caller (Apify) can pre-load from KVS and pass its own dict; CLI runs
+        # fall back to the local JSON file.
+        if kcoj_seen_cases is None:
+            kcoj_seen_cases = load_kcoj_seen_cases()
+        logger.info("KCOJ cross-run dedup: %d previously-emitted cases loaded", len(kcoj_seen_cases))
+
+        for search in kcoj_searches:
+            # KCOJ dockets are indexed by hearing date, not filing date. "Daily"
+            # mode pulls today; "historical" mode pulls today only too — there
+            # is no bulk historical lookup on this portal without a CourtNet
+            # subscription. If a backfill is desired, the caller should invoke
+            # kcoj_scraper.scrape_kcoj() per-date in a loop.
+            target_date = datetime.now().strftime("%Y-%m-%d")
+            division = getattr(search, "kcoj_division", "") or "District"
+            logger.info(
+                "KCOJ search: %s (%s %s on %s)",
+                search.saved_search_name, search.county, division, target_date,
+            )
+            try:
+                kcoj_notices = await scrape_kcoj_dockets(
+                    county=search.county,
+                    division=division,
+                    target_date=target_date,
+                    notice_type=search.notice_type,
+                    seen_cases=kcoj_seen_cases,
+                )
+                all_notices.extend(kcoj_notices)
+                if on_batch and kcoj_notices:
+                    await on_batch(kcoj_notices)
+            except Exception:
+                logger.exception("KCOJ scrape failed: %s", search.saved_search_name)
+
+            try:
+                # Local file persistence — harmless no-op in Apify where the
+                # filesystem is ephemeral (the real backing store is KVS via
+                # on_kcoj_search_complete below).
+                save_kcoj_seen_cases(kcoj_seen_cases)
+                save_seen_ids(seen_ids)
+                if mode == "daily":
+                    save_last_run_date()
+                if on_kcoj_search_complete is not None:
+                    await on_kcoj_search_complete(kcoj_seen_cases)
+                if on_search_complete is not None:
+                    await on_search_complete(seen_ids)
+            except Exception:
+                logger.exception("Failed to persist state after KCOJ search")
+
+    # ── Jefferson County Deeds (HTTP-only, no browser) ─────────────────
+    if jcd_searches:
+        from jefferson_deeds_scraper import (
+            last_n_business_days,
+            scrape_jefferson_deeds,
+            load_jcd_seen,
+            save_jcd_seen,
+        )
+
+        # JCD has its own cross-run dedup cache (instrument-key → first-seen),
+        # mirroring kcoj_seen_cases. LP filings recur in the rolling daily
+        # window; without this, a daily Apify run re-pushes the same instruments
+        # (and re-pays the PDF/OCR cost). Caller (Apify) can pre-load from KVS
+        # and pass its own dict; CLI runs fall back to the local JSON file.
+        if jcd_seen is None:
+            jcd_seen = load_jcd_seen()
+        logger.info("JCD cross-run dedup: %d previously-emitted instruments loaded", len(jcd_seen))
+
+        for search in jcd_searches:
+            # Determine date range for this JCD search
+            if since_date:
+                start = since_date
+                end = datetime.now().strftime("%Y-%m-%d")
+            elif mode == "historical":
+                start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+                end = datetime.now().strftime("%Y-%m-%d")
+            else:
+                start, end = last_n_business_days(7)  # default: last week
+
+            logger.info(
+                "JCD search: %s (%s → %s)",
+                search.saved_search_name, start, end,
+            )
+            try:
+                jcd_notices = scrape_jefferson_deeds(
+                    start_date=start,
+                    end_date=end,
+                    notice_type=search.notice_type,
+                    county=search.county,
+                    seen_instruments=jcd_seen,
+                )
+                all_notices.extend(jcd_notices)
+                if on_batch and jcd_notices:
+                    await on_batch(jcd_notices)
+            except Exception:
+                logger.exception("JCD scrape failed: %s", search.saved_search_name)
+
+            try:
+                # Local file persistence — harmless no-op in Apify where the
+                # filesystem is ephemeral (the real backing store is KVS via
+                # on_jcd_search_complete below).
+                save_jcd_seen(jcd_seen)
+                save_seen_ids(seen_ids)
+                if mode == "daily":
+                    save_last_run_date()
+                if on_jcd_search_complete is not None:
+                    await on_jcd_search_complete(jcd_seen)
+                if on_search_complete is not None:
+                    await on_search_complete(seen_ids)
+            except Exception:
+                logger.exception("Failed to persist state after JCD search")
+
+    # ── TN Public Notice (Playwright + CAPTCHA) ─────────────────────────
+    if not tnpn_searches:
+        # No TNPN searches — skip browser launch entirely
+        if mode == "daily":
+            save_last_run_date()
+        save_seen_ids(seen_ids)
+        save_captcha_failed_ids(captcha_failed_ids)
+        logger.info("Total notices scraped: %d", len(all_notices))
+        return all_notices
+
+    searches = tnpn_searches  # only launch browser for TNPN searches
+    _load_playwright()
 
     async with async_playwright() as p:
         launch_opts: dict = {"headless": True}

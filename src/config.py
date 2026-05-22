@@ -25,6 +25,22 @@ CAPTCHA_FAILED_PRUNE_DAYS = 14
 COOKIES_FILE = PROJECT_ROOT / "cookies.json"
 DROPBOX_STATE_FILE = PROJECT_ROOT / "dropbox_state.json"
 PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
+# KCOJ dockets recur the same case on multiple days (probate estates can have
+# motion hours, settlement reviews, etc. for months or years). Cross-run dedup
+# by case_number keeps DataSift uploads from duplicating on the daily Apify run.
+KCOJ_SEEN_CASES_FILE = PROJECT_ROOT / "kcoj_seen_cases.json"
+KCOJ_SEEN_CASES_PRUNE_DAYS = 90
+# Jefferson County Deeds (JCD) lis pendens recur in the rolling daily window;
+# cross-run dedup by recorded-instrument key keeps the daily Apify run from
+# re-pushing the same LP filings (and re-paying the PDF/OCR cost — see 3b).
+JCD_SEEN_FILE = PROJECT_ROOT / "jcd_seen_instruments.json"
+JCD_SEEN_PRUNE_DAYS = 120   # LP filings resolve faster than probate; covers the rolling window + slack
+# Re-poll queue (Phase 6 / COVER-01): fresh CourtNet/obit filings that
+# return 0 rows are enqueued here and re-searched after a delay instead of
+# being dropped. Mirrors the kcoj_seen_cases plumbing; different key.
+KCOJ_REPOLL_FILE = PROJECT_ROOT / "kcoj_repoll_queue.json"
+REPOLL_DELAY_BUSINESS_DAYS = 4   # business days to wait before re-searching a 0-row lead
+REPOLL_MAX_ATTEMPTS = 3          # cap re-polls, then drop with an audit note
 
 # ── Dropbox Watcher ────────────────────────────────────────────────────
 DROPBOX_POLL_INTERVAL = int(os.getenv("DROPBOX_POLL_INTERVAL", "900"))  # seconds (default 15 min)
@@ -54,6 +70,26 @@ ANCESTRY_PASSWORD = os.getenv("ANCESTRY_PASSWORD", "")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "")            # Dropbox OAuth2 app key
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "")
 DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "")
+PVA_EMAIL = os.getenv("PVA_EMAIL", "")                        # Jefferson County KY PVA login (jeffersonpva.ky.gov)
+PVA_PASSWORD = os.getenv("PVA_PASSWORD", "")
+GOOGLE_SERVICE_ACCOUNT_KEY = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY", "")  # base64-encoded service account JSON
+
+# ── Disposition Flyer ────────────────────────────────────────────────
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Rednour Real Estate Services")
+COMPANY_PHONE = os.getenv("COMPANY_PHONE", "5022241882")
+REDNOUR_DRIVE_PARENT_FOLDER_ID = os.getenv(
+    "REDNOUR_DRIVE_PARENT_FOLDER_ID", ""
+)  # Drive folder containing per-property subfolders (each with a Photos/ subfolder)
+COMPANY_LOGO_PATH = PROJECT_ROOT / "assets" / "rednour_logo.png"
+
+# ── Wholesale-Fit Gate ────────────────────────────────────────────────
+# Buyer-box thresholds for the wholesale-fit scorer (Phase 4 / src/wholesale_fit.py).
+# Config, not hardcoded, so the buyer box can move without a code change. Defaults are
+# starting points to calibrate against the first ~100 scored leads.
+WHOLESALE_MIN_VALUE = int(os.getenv("WHOLESALE_MIN_VALUE", "30000"))      # below this + teardown/vacant-lot = hard drop
+WHOLESALE_MAX_VALUE = int(os.getenv("WHOLESALE_MAX_VALUE", "450000"))     # above this = luxury-tier soft demotion (kept)
+WHOLESALE_MIN_EQUITY_PCT = int(os.getenv("WHOLESALE_MIN_EQUITY_PCT", "10"))  # equity% <= this + active mortgage = negative-equity hard drop
+SKIP_TRACE_MIN_FIT = int(os.getenv("SKIP_TRACE_MIN_FIT", "40"))           # fit score below this = excluded from PAID skip trace
 
 # ── LLM Backend ──────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")           # "anthropic", "ollama", or "openrouter"
@@ -102,23 +138,38 @@ TESSERACT_PSM_PDF = 3    # fully automatic — best for PDF tax sale tables
 TESSERACT_PSM_PHOTO = 4  # assume single column of variable-size text — best for terminal screen photos
 
 # ── Notice Types ───────────────────────────────────────────────────────
-NOTICE_TYPES = ["foreclosure", "probate"]
+NOTICE_TYPES = ["foreclosure", "probate", "lis_pendens"]
 
 
 @dataclass
 class SavedSearch:
-    """Represents a saved search on tnpublicnotice.com."""
+    """Represents a saved search — one of the configured data-source portals."""
     county: str
-    notice_type: str  # One of NOTICE_TYPES
-    saved_search_name: str  # Exact name in the Saved Searches dropdown
+    notice_type: str        # One of NOTICE_TYPES
+    saved_search_name: str  # Exact dropdown name (TNPN) or descriptive label (JCD, KCOJ)
+    source: str = "tnpn"    # "tnpn" = TN Public Notice | "jcd" = Jefferson County Deeds | "kcoj" = Kentucky Court of Justice dockets
+    # KCOJ-specific: "District" or "Circuit". Jefferson County KY probate is District Court class P.
+    kcoj_division: str = ""
 
 
 # ── Saved Searches ─────────────────────────────────────────────────────
-# These names must match exactly what appears in the dropdown on the site.
+# TNPN entries: saved_search_name must match exactly what appears in the dropdown.
+# JCD entries:  saved_search_name is a descriptive label; source="jcd" routes to
+#               jefferson_deeds_scraper instead of the Playwright-based scraper.
+# KCOJ entries: saved_search_name is a descriptive label; source="kcoj" routes to
+#               kcoj_scraper. Set kcoj_division="District" or "Circuit".
 SAVED_SEARCHES: list[SavedSearch] = [
     SavedSearch("Knox", "foreclosure", "Foreclosure V2 Knox"),
     SavedSearch("Blount", "foreclosure", "Foreclosure V2 Blount"),
+    SavedSearch("Jefferson", "lis_pendens", "LIS PENDENS Jefferson County", source="jcd"),
+    SavedSearch(
+        "Jefferson", "probate", "Jefferson KY District Probate",
+        source="kcoj", kcoj_division="District",
+    ),
 ]
+
+# ── Jefferson County Deeds (Louisville, KY) ────────────────────────────
+JCD_BASE_URL = "https://search.jeffersondeeds.com"
 
 # ── Entity Detection ──────────────────────────────────────────────────
 # Business entity patterns — shared across obituary_enricher, tax_enricher,

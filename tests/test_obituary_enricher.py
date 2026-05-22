@@ -9,8 +9,9 @@ from obituary_enricher import (
     parse_tax_owner_name, identify_decision_maker, _is_obituary_url,
     rank_decision_makers, _extract_structured_text, _is_listing_url,
     _extract_personal_from_trust_estate, _get_name_variants,
-    _parse_notice_owner_name,
+    _parse_notice_owner_name, _apply_obituary_match,
 )
+from kentucky_name_resolver import generate_variants
 from notice_parser import NoticeData
 
 
@@ -557,6 +558,71 @@ def test_nickname_case_insensitive():
     """Should work regardless of case."""
     variants = _get_name_variants("MARGARET")
     assert "maggie" in variants or "peggy" in variants
+
+
+# ── Obituary maiden / also-known-as → generate_variants (NAME-03) ────
+
+
+def test_obituary_schema_maiden_aka():
+    """A confirmed obituary match reads maiden_name + also_known_as from the
+    LLM JSON and persists them on the parsed result (no live LLM/network).
+
+    Defaults apply when the keys are absent."""
+    notice = NoticeData(
+        notice_type="probate", county="Jefferson", state="KY",
+        owner_name="Dorothy Emma Jackson", decedent_name="Dorothy Emma Jackson",
+    )
+    parsed = {
+        "match": True,
+        "full_name": "Dorothy Emma Jackson",
+        "date_of_death": "2026-01-03",
+        "survivors": [{"name": "Monroe Jackson Jr", "relationship": "son"}],
+        "executor_named": "",
+        "preceded_in_death": [],
+        "maiden_name": "Greathouse",
+        "also_known_as": ["Koenig"],
+    }
+    _apply_obituary_match(notice, parsed, url="https://example.com/obit", source_type="full_page")
+    assert parsed["maiden_name"] == "Greathouse", f"Got: {parsed['maiden_name']!r}"
+    assert parsed["also_known_as"] == ["Koenig"], f"Got: {parsed['also_known_as']!r}"
+
+    # Absent keys → safe defaults (no KeyError / no crash).
+    notice2 = NoticeData(notice_type="probate", owner_name="Jane Doe", decedent_name="Jane Doe")
+    parsed2 = {"match": True, "full_name": "Jane Doe", "survivors": [], "executor_named": ""}
+    _apply_obituary_match(notice2, parsed2, url="https://example.com/obit2", source_type="snippet")
+    assert parsed2["maiden_name"] == ""
+    assert parsed2["also_known_as"] == []
+
+
+def test_obituary_feeds_generate_variants():
+    """Extracted maiden (maiden_obit) + aka (prior_married) flow into the
+    resolver's variant generator."""
+    variants = generate_variants(
+        "Dorothy Emma Jackson", maiden_name="Greathouse", prior_surnames=["Koenig"],
+    )
+    assert any(v.source == "maiden_obit" and "GREATHOUSE" in v.value for v in variants), \
+        f"no maiden_obit GREATHOUSE in {[(v.source, v.value) for v in variants]}"
+    assert any(v.source == "prior_married" and "KOENIG" in v.value for v in variants), \
+        f"no prior_married KOENIG in {[(v.source, v.value) for v in variants]}"
+
+
+def test_obituary_maiden_persists_variants_on_result():
+    """End-to-end read-path: a confirmed obituary with a maiden name persists
+    the resolver's ordered search variants on the parsed result (for Plan 04
+    PVA/deeds wiring) without any live LLM/network call."""
+    notice = NoticeData(
+        notice_type="probate", county="Jefferson", state="KY",
+        owner_name="Dorothy Emma Jackson", decedent_name="Dorothy Emma Jackson",
+    )
+    parsed = {
+        "match": True, "full_name": "Dorothy Emma Jackson",
+        "survivors": [], "executor_named": "",
+        "maiden_name": "Greathouse", "also_known_as": ["Koenig"],
+    }
+    _apply_obituary_match(notice, parsed, url="https://example.com/obit", source_type="full_page")
+    variant_values = parsed.get("name_variants", [])
+    assert any("GREATHOUSE" in v for v in variant_values), f"Got: {variant_values}"
+    assert any("KOENIG" in v for v in variant_values), f"Got: {variant_values}"
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 """Enrich notices with tax delinquency data from county property tax APIs.
 
-Knox County: https://knox-tn.mygovonline.com/api/v2
-Blount County: TBD (placeholder)
+Knox County (TN):      https://knox-tn.mygovonline.com/api/v2          ← active
+Blount County (TN):    TBD — no public tax API; placeholder
+Jefferson County (KY): handled via ``kentucky_pva_lookup.py`` instead;
+                       Jefferson PVA exposes assessed value but not
+                       delinquency status, so KY tax delinquency is a
+                       separate future integration (Sheriff's tax search)
 """
 
 import logging

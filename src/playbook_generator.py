@@ -1,7 +1,7 @@
 """Acquisition playbook generator with SOPs, scripts, and daily checklists.
 
 Generates custom playbooks based on investment blueprint (wholesale/flip/hold),
-market (Knoxville/Blount), and team size (solo to full operation).
+market (Knoxville/Blount TN, Louisville KY), and team size (solo to full op).
 
 Output:
   - Markdown playbook document (comprehensive SOP)
@@ -296,12 +296,22 @@ def generate_playbook(blueprint: str = "wholesale", market: str = "knoxville",
     bp = BLUEPRINTS.get(blueprint, BLUEPRINTS["wholesale"])
     team = TEAM_CONFIGS.get(team_size, TEAM_CONFIGS[1])
     market_name = market.title()
+    # Map market to its state. Add new (KY/etc.) markets here as the
+    # platform expands — keeps the playbook header accurate per locale.
+    market_state = {
+        "knox":      "Tennessee",
+        "blount":    "Tennessee",
+        "knoxville": "Tennessee",
+        "maryville": "Tennessee",
+        "jefferson": "Kentucky",
+        "louisville": "Kentucky",
+    }.get(market.lower(), "Tennessee")
 
     lines = []
     lines.append(f"# {bp['name']} Acquisition Playbook — {market_name}")
     lines.append(f"")
     lines.append(f"**Blueprint:** {bp['name']} — {bp['description']}")
-    lines.append(f"**Market:** {market_name}, Tennessee")
+    lines.append(f"**Market:** {market_name}, {market_state}")
     lines.append(f"**Team:** {team['name']} ({team_size} {'person' if team_size == 1 else 'people'})")
     lines.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d')}")
     lines.append(f"")
@@ -386,18 +396,27 @@ def generate_playbook(blueprint: str = "wholesale", market: str = "knoxville",
     lines.append(f"**Key stat:** 20-30% of deals come from not-interested follow-ups.")
     lines.append(f"")
 
-    # CLI reference
+    # CLI reference — uses the playbook's specific market for examples.
+    cli_county = market_name  # already title-cased
+    sample_addr_state = "TN" if market_state == "Tennessee" else "KY"
+    sample_addr_zip = "37918" if market_state == "Tennessee" else "40218"
+    sample_addr_city = market_name if market.lower() in (
+        "knoxville", "maryville", "louisville",
+    ) else (
+        "Knoxville" if market_state == "Tennessee" else "Louisville"
+    )
+
     lines.append(f"## Quick CLI Reference")
     lines.append(f"")
     lines.append(f"```bash")
     lines.append(f"# Daily scrape")
-    lines.append(f"python src/main.py daily --counties Knox,Blount --upload-datasift")
+    lines.append(f"python src/main.py daily --counties {cli_county} --upload-datasift")
     lines.append(f"")
     lines.append(f"# Lead qualification")
     lines.append(f"python src/main.py lead-manage --action qualify --csv-path output/latest.csv")
     lines.append(f"")
     lines.append(f"# Comp analysis")
-    lines.append(f'python src/main.py comp --address "123 Main St, Knoxville, TN 37918"')
+    lines.append(f'python src/main.py comp --address "123 Main St, {sample_addr_city}, {sample_addr_state} {sample_addr_zip}"')
     lines.append(f"")
     lines.append(f"# Deal analysis")
     lines.append(f'python src/main.py analyze-deal --address "123 Main St" --purchase-price 150000')
@@ -409,7 +428,7 @@ def generate_playbook(blueprint: str = "wholesale", market: str = "knoxville",
     lines.append(f"python src/main.py deep-prospect --csv-path output/records.csv --depth 3")
     lines.append(f"")
     lines.append(f"# Market analysis")
-    lines.append(f"python src/main.py market-analysis --counties Knox,Blount")
+    lines.append(f"python src/main.py market-analysis --counties {cli_county}")
     lines.append(f"```")
 
     content = "\n".join(lines)

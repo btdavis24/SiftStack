@@ -96,6 +96,11 @@ SIFT_COLUMNS = [
     "source_url",
     # Pipeline metadata
     "run_id",
+    # Tracerfy skip trace — phones + emails
+    "primary_phone",
+    "mobile_1", "mobile_2", "mobile_3", "mobile_4", "mobile_5",
+    "landline_1", "landline_2", "landline_3",
+    "email_1", "email_2", "email_3", "email_4", "email_5",
 ]
 
 
@@ -289,6 +294,21 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
                 "entity_research_confidence": notice.entity_research_confidence,
                 "source_url": notice.source_url,
                 "run_id": notice.run_id,
+                # Tracerfy phones + emails
+                "primary_phone": notice.primary_phone,
+                "mobile_1": notice.mobile_1,
+                "mobile_2": notice.mobile_2,
+                "mobile_3": notice.mobile_3,
+                "mobile_4": notice.mobile_4,
+                "mobile_5": notice.mobile_5,
+                "landline_1": notice.landline_1,
+                "landline_2": notice.landline_2,
+                "landline_3": notice.landline_3,
+                "email_1": notice.email_1,
+                "email_2": notice.email_2,
+                "email_3": notice.email_3,
+                "email_4": notice.email_4,
+                "email_5": notice.email_5,
             }
             writer.writerow(row)
             written += 1

@@ -23,6 +23,10 @@ from ddgs import DDGS
 from datetime import datetime
 
 import llm_client
+# Canonical name primitives — pre-positioned for Plan 03/04 (obituary maiden /
+# aka extraction feeding generate_variants). Not yet wired into matching here;
+# this task only consolidates imports and does not alter obituary outputs.
+from kentucky_name_resolver import SUFFIX_RE, name_tokens, score_match  # noqa: F401
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -39,6 +43,31 @@ MAX_ADDRESS_TEXT = 15000  # Larger limit for people search pages (CBC has 250+ r
 # Maximum years between DOD and notice filing date to accept an obituary match.
 # Probate is typically filed within 1-2 years of death. 3 years gives margin.
 MAX_DOD_GAP_YEARS = 3
+
+# Re-poll enqueue freshness window (Phase 6 / COVER-01): only a recently-filed
+# decedent whose obituary isn't posted yet is "plausibly just-not-posted-yet".
+# A filing older than this is treated as stale (the obituary should exist by now
+# if it ever will), so it is NOT enqueued for re-poll. Unparseable / missing
+# date_added is treated as fresh (daily-run leads are fresh by construction).
+REPOLL_OBIT_FRESH_DAYS = 30
+
+
+def _is_fresh_filing_for_repoll(notice: "NoticeData", today: str | None = None) -> bool:
+    """True when ``notice`` is a plausibly-just-filed lead whose obituary may
+    simply not be posted yet (enqueue-worthy), False when clearly stale.
+
+    Missing or unparseable ``date_added`` -> True (fresh by default; daily-run
+    leads are fresh). A filing older than ``REPOLL_OBIT_FRESH_DAYS`` -> False."""
+    raw = (getattr(notice, "date_added", "") or "").strip()
+    if not raw:
+        return True
+    try:
+        filed = datetime.strptime(raw, "%Y-%m-%d")
+    except ValueError:
+        return True
+    ref = datetime.strptime(today, "%Y-%m-%d") if today else datetime.now()
+    age_days = (ref - filed).days
+    return age_days <= REPOLL_OBIT_FRESH_DAYS
 
 
 def _dod_sanity_check(dod_str: str, notice: "NoticeData") -> bool:
@@ -85,7 +114,9 @@ KNOWN_403_DOMAINS = {
     "funeralhomes.com",
 }
 
-# Known obituary domains — filter search results to these
+# Known obituary domains — filter search results to these. Local newspapers
+# and funeral-home aggregators are the highest-quality sources; national
+# domains (legacy.com, mem.com) provide broader coverage.
 OBITUARY_DOMAINS = {
     "legacy.com",
     "dignitymemorial.com",
@@ -97,12 +128,66 @@ OBITUARY_DOMAINS = {
     "meaningfulfunerals.net",
     "mem.com",
     "forevermissed.com",
-    "knoxnews.com",
-    "thedailytimes.com",
+    # TN — Knox & Blount metro
+    "knoxnews.com",            # Knoxville News Sentinel
+    "thedailytimes.com",       # The Daily Times (Maryville/Blount)
+    # KY — Louisville/Jefferson metro
+    "courier-journal.com",     # Louisville Courier-Journal (USA Today network)
+    "kentucky.com",            # Lexington Herald-Leader (statewide reach)
+    "wave3.com",               # WAVE Louisville (occasional obit pages)
+    "louisvilleobits.com",     # local aggregator if exists; cheap to whitelist
 }
 
-# Legal suffixes to strip from tax API owner names before searching
-_SUFFIX_RE = re.compile(
+
+# State-aware helpers — used by every search query builder so KY notices
+# search "Kentucky" obituaries while TN notices keep searching "Tennessee".
+_STATE_FULL_NAMES = {
+    "TN": "Tennessee",
+    "KY": "Kentucky",
+}
+
+
+def _state_full_name(state_code: str) -> str:
+    """'TN' → 'Tennessee', 'KY' → 'Kentucky'. Default 'Tennessee' for back-compat."""
+    code = (state_code or "").strip().upper()
+    return _STATE_FULL_NAMES.get(code, "Tennessee")
+
+
+# Default city per county — used when notice.city is empty (common for
+# decedents whose KCOJ docket entry didn't propagate a city).
+_DEFAULT_CITY_BY_COUNTY = {
+    "knox":      "Knoxville",
+    "blount":    "Maryville",
+    "jefferson": "Louisville",
+}
+
+
+def _default_city(notice: "NoticeData") -> str:
+    """City fallback when notice.city is empty. County-aware."""
+    if (notice.city or "").strip():
+        return notice.city.strip()
+    return _DEFAULT_CITY_BY_COUNTY.get(
+        (notice.county or "").strip().lower(),
+        "Knoxville",  # legacy default for un-recognized counties
+    )
+
+
+def _default_state(notice: "NoticeData") -> str:
+    """2-letter state code with KY/TN aware defaulting."""
+    code = (notice.state or "").strip().upper()
+    if code in ("TN", "KY"):
+        return code
+    # Heuristic: Jefferson → KY (no other KY county is targeted yet);
+    # everything else → TN (legacy).
+    if (notice.county or "").strip().lower() == "jefferson":
+        return "KY"
+    return "TN"
+
+# Role/legal suffixes to strip from tax API owner names before searching.
+# NOTE: This is the ROLE-suffix regex (LIFE ESTATE / PERSONAL REP / TRUSTEE /
+# TRUST / ETAL) — a different concern from the canonical JR/SR name-suffix
+# SUFFIX_RE in kentucky_name_resolver. Named distinctly to avoid the collision.
+_ROLE_SUFFIX_RE = re.compile(
     r"\s*\(?\s*(?:LIFE\s+EST(?:ATE)?|PERSONAL\s+REP(?:RESENTATIVE)?|"
     r"TRUSTEE|TRUST|ETAL|ET\s+AL)\s*\)?\s*$",
     re.IGNORECASE,
@@ -215,12 +300,12 @@ OBITUARY_PROMPT = """\
 I have a property record with this owner information:
 - Owner name: {owner_name}
 - Property city: {city}
-- Property state: Tennessee
+- Property state: {state_name}
 - Property address: {address}
 
 Below is text from a potential obituary. Determine if this obituary is for the same person \
 as the property owner. Consider: name match (first + last name must match; middle name/initial \
-is bonus confirmation), location match (same city or county in Tennessee), and timeline \
+is bonus confirmation), location match (same city or county in {state_name}), and timeline \
 plausibility (death within last 5 years is typical for active foreclosure/tax sale records).
 
 Return a JSON object with these exact keys:
@@ -239,6 +324,8 @@ Include partial names (e.g. just a first name) — use the deceased's last name 
 Include full names when available. (city is where the survivor lives if mentioned, empty string if not stated)
 - "preceded_in_death": array of names of family members who predeceased them
 - "executor_named": name of executor/personal representative if mentioned, empty string if not
+- "maiden_name": the deceased's maiden/birth surname if stated (e.g. "née Smith", "formerly Smith", "maiden name Smith", or a surname in parentheses after the first name), empty string if not found
+- "also_known_as": array of any OTHER prior or alternate surnames the deceased used (prior married names, legal name changes, "formerly Jones"), empty array if none
 
 Important: Only set "match" to true if the first AND last name match the owner. \
 Common names need location confirmation. Be conservative — a false negative is better \
@@ -283,7 +370,7 @@ def parse_tax_owner_name(raw: str) -> list[str]:
         return []
 
     # Strip legal suffixes
-    name = _SUFFIX_RE.sub("", name).strip()
+    name = _ROLE_SUFFIX_RE.sub("", name).strip()
 
     # Handle care-of (%) — only search the primary name (before %)
     if "%" in name:
@@ -365,7 +452,7 @@ def _parse_notice_owner_name(raw: str) -> list[str]:
     # Strip notice-specific suffixes (Tenants By The Entirety, etc.)
     name = _NOTICE_SUFFIX_RE.sub("", name).strip()
     # Strip tax-API suffixes too (LIFE EST, ETAL, etc.)
-    name = _SUFFIX_RE.sub("", name).strip()
+    name = _ROLE_SUFFIX_RE.sub("", name).strip()
 
     # Split on " AND " (word) or "&" (symbol)
     parts = re.split(r"\s+AND\s+|\s*&\s*", name, flags=re.IGNORECASE)
@@ -395,7 +482,9 @@ def _is_obituary_url(url: str) -> bool:
     return False
 
 
-def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
+def _search_obituary(
+    name: str, city: str, extra_terms: str = "", state: str = "TN",
+) -> list[dict]:
     """Search DuckDuckGo for obituary pages matching the person.
 
     Args:
@@ -403,11 +492,15 @@ def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
         city: City for geo-filtering (empty string to omit).
         extra_terms: Additional search terms to replace "obituary" keyword
                      (e.g. '"death notice" OR "funeral"').
+        state: 2-letter state code; controls which state name appears in
+               the search query. Default "TN" preserves legacy behavior.
 
     Returns list of {url, title, snippet} for obituary-domain results.
     """
     keyword = extra_terms if extra_terms else "obituary"
-    query = f'{name} {keyword} Tennessee' if not city else f'{name} {keyword} {city} Tennessee'
+    state_name = _state_full_name(state)
+    query = (f'{name} {keyword} {state_name}' if not city
+             else f'{name} {keyword} {city} {state_name}')
 
     try:
         results = DDGS().text(query, max_results=8, backend="google,duckduckgo,brave")
@@ -563,14 +656,16 @@ def _refetch_specific_obituary(
     original_url: str,
     api_key: str,
     address: str = "",
+    state: str = "TN",
 ) -> tuple[dict | None, str, str]:
     """Re-search for a specific obituary page when original match was a listing page.
 
     Returns (parsed, url, source_type) or (None, "", "") if unsuccessful.
     """
+    state_name = _state_full_name(state)
     queries = [
         f'"{name}" obituary site:legacy.com',
-        f'"{name}" obituary {city} Tennessee "survived by"',
+        f'"{name}" obituary {city} {state_name} "survived by"',
     ]
 
     for query in queries:
@@ -652,16 +747,18 @@ def _search_survivors_targeted(
     name: str,
     city: str,
     api_key: str,
+    state: str = "TN",
 ) -> list[dict]:
     """Run targeted searches for survivor names when standard snippet lacks them.
 
     Returns list of survivor dicts [{name, relationship}] or empty list.
     """
+    state_name = _state_full_name(state)
     queries = [
-        f'"{name}" "survived by" {city} Tennessee',
-        f'"{name}" "preceded in death" {city} Tennessee',
+        f'"{name}" "survived by" {city} {state_name}',
+        f'"{name}" "preceded in death" {city} {state_name}',
         f'"{name}" obituary wife OR husband OR son OR daughter {city}',
-        f'"{name}" funeral OR memorial service {city} Tennessee',
+        f'"{name}" funeral OR memorial service {city} {state_name}',
     ]
 
     all_snippets = []
@@ -1330,21 +1427,123 @@ def _batch_tracerfy_lookup(notices: list) -> None:
         logger.warning("Tracerfy batch lookup failed: %s", e)
 
 
+def _lookup_dm_address_ky(name: str, city: str, api_key: str) -> dict | None:
+    """KY (Jefferson) address waterfall for a DM/heir, mirroring the TN tier shape.
+
+    Builds owner-search variants for ``name`` via the Phase 1 resolver (imported
+    DEFENSIVELY), then searches the Jefferson PVA by owner until a parcel with a
+    non-empty address comes back. Maps the PvaRow -> the standard address dict.
+    Returns None on a PVA miss so the caller's existing national people-search
+    tier can still try (that path already works nationally).
+    """
+    if not name or not name.strip():
+        return None
+
+    # Phase 1 variant generator — defensive import; fall back to [name].
+    try:
+        from kentucky_name_resolver import generate_variants
+    except ImportError:
+        generate_variants = None
+
+    variants: list[str] = []
+    if generate_variants is not None:
+        try:
+            for v in generate_variants(name):
+                if v.value and v.value not in variants:
+                    variants.append(v.value)
+        except Exception as e:  # never crash the waterfall on a variant bug
+            logger.debug("KY variant generation failed for %s: %s", name, e)
+    if not variants:
+        # Fall back to the raw name plus a LAST FIRST flip (PVA is owner-indexed).
+        parts = name.split()
+        variants = [name]
+        if len(parts) >= 2:
+            flipped = f"{parts[-1]} {' '.join(parts[:-1])}"
+            if flipped not in variants:
+                variants.append(flipped)
+
+    # Lazy/local import to avoid a hard module cycle.
+    try:
+        import kentucky_pva_lookup as pva
+    except ImportError as e:
+        logger.debug("kentucky_pva_lookup unavailable for KY DM lookup: %s", e)
+        return None
+
+    try:
+        session = requests.Session()
+    except Exception as e:
+        logger.debug("Could not open PVA session for %s: %s", name, e)
+        return None
+
+    for variant in variants:
+        try:
+            rows = pva.search_by_owner(session, variant)
+        except Exception as e:
+            logger.debug("PVA search_by_owner failed for %r: %s", variant, e)
+            continue
+        for row in rows or []:
+            addr = (getattr(row, "address", "") or "").strip()
+            if addr:
+                logger.info("    Tier 1 (KY PVA): %s [%s]", addr, variant)
+                return {
+                    "street": addr,
+                    "city": city or "Louisville",
+                    "state": "KY",
+                    "zip": "",
+                    "source": "ky_pva",
+                }
+
+    return None
+
+
 def _lookup_dm_address(
     name: str, city: str, api_key: str, tracerfy_tier1: bool = False,
+    state: str = "",
 ) -> dict:
-    """Look up decision-maker's mailing address using tiered sources.
+    """Look up decision-maker's mailing address using tiered, market-aware sources.
 
     Tier 0 (opt-in): Tracerfy skip tracing (paid, highest hit rate)
-    Tier 1: Knox County Tax API (free, fast, Knox only)
+    Tier 1 (KY): Jefferson PVA owner search (when state == "KY")
+    Tier 1 (TN/Knox): Knox County Tax API (free, fast, Knox only)
     Tier 2: Serper.dev + Firecrawl + LLM (cheap, national)
     Tier 2b: DuckDuckGo fallback (free, unreliable -- used when Serper not configured)
 
+    The ``state`` hint (default "" preserves all existing TN/Knox callers)
+    dispatches the free property tier: KY -> PVA, everything else -> Knox Tax.
     Returns {street, city, state, zip, source} (may have empty values).
     """
     result = {"street": "", "city": "", "state": "", "zip": "", "source": ""}
 
     if not name or not name.strip():
+        return result
+
+    # Tier 1 (KY): Jefferson PVA owner search. KY notices must NOT fall through
+    # to the Knox Tax tier (TN-only) — on a PVA miss, drop straight to the
+    # national web tiers below.
+    if state.strip().upper() == "KY":
+        ky_result = _lookup_dm_address_ky(name, city, api_key)
+        if ky_result and ky_result.get("street"):
+            result.update(ky_result)
+            return result
+        # fall through to Tier 2 web search (national) — NOT Knox Tax.
+        import config as cfg
+        sf_result = _lookup_dm_address_serper_firecrawl(
+            name, city or "Louisville", api_key
+        )
+        if sf_result and sf_result.get("street"):
+            result.update(sf_result)
+            result["source"] = "people_search"
+            logger.info("    Tier 2 (People Search): %s, %s",
+                        result["street"], result["city"])
+            return result
+        if not cfg.SERPER_API_KEY and not cfg.FIRECRAWL_API_KEY:
+            web_result = _lookup_dm_address_web(name, city or "Louisville", api_key)
+            if web_result and web_result.get("street"):
+                result.update(web_result)
+                result["source"] = "ddg_people_search"
+                logger.info("    Tier 2b (DDG): %s, %s",
+                            result["street"], result["city"])
+                return result
         return result
 
     # Tier 0 (opt-in): Tracerfy as primary lookup
@@ -1488,6 +1687,7 @@ def _parse_obituary_with_llm(
     city: str,
     address: str,
     api_key: str,
+    state: str = "TN",
 ) -> dict | None:
     """Use Claude Haiku to validate and parse an obituary.
 
@@ -1503,6 +1703,7 @@ def _parse_obituary_with_llm(
     prompt = OBITUARY_PROMPT.format(
         owner_name=owner_name,
         city=city or "unknown",
+        state_name=_state_full_name(state),
         address=address or "unknown",
         obituary_text=obituary_text[:MAX_OBITUARY_TEXT],
     )
@@ -1770,6 +1971,7 @@ def verify_heir_status(
     api_key: str,
     depth: int = 0,
     max_depth: int = 2,
+    state: str = "TN",
 ) -> dict:
     """Search for an obituary for a single heir to verify alive/dead.
 
@@ -1786,8 +1988,9 @@ def verify_heir_status(
         "search_log": {"query": "", "result": "not_searched"},
     }
 
-    results = _search_obituary(heir_name, city)
-    result["search_log"]["query"] = f"{heir_name} obituary {city} Tennessee"
+    state_name = _state_full_name(state)
+    results = _search_obituary(heir_name, city, state=state)
+    result["search_log"]["query"] = f"{heir_name} obituary {city} {state_name}"
 
     if not results:
         # No search results at all — likely alive (no obituary exists online)
@@ -1807,6 +2010,7 @@ def verify_heir_status(
                 city=city,
                 address="",  # don't know heir's address
                 api_key=api_key,
+                state=state,
             )
             if parsed and parsed.get("confidence") in ("high", "medium"):
                 result["status"] = "deceased"
@@ -1834,6 +2038,7 @@ def verify_heir_status(
             city=city,
             address="",
             api_key=api_key,
+            state=state,
         )
         if parsed and parsed.get("confidence") == "high":
             result["status"] = "deceased"
@@ -1857,6 +2062,7 @@ def build_heir_map(
     api_key: str,
     raw_name: str = "",
     max_depth: int = 2,
+    state: str = "TN",
 ) -> tuple[list[dict], dict]:
     """Build heir map with verification, return (ranked_dms, error_info).
 
@@ -1920,7 +2126,7 @@ def build_heir_map(
         logger.info("    Verifying heir: %s", vname)
         return vname, verify_heir_status(
             heir_name=vname, city=city, api_key=api_key,
-            depth=0, max_depth=max_depth,
+            depth=0, max_depth=max_depth, state=state,
         )
 
     sub_heirs_to_check: list[tuple[str, list]] = []
@@ -1952,7 +2158,7 @@ def build_heir_map(
         logger.info("      Verifying sub-heir: %s", vname)
         return vname, _, verify_heir_status(
             heir_name=vname, city=city, api_key=api_key,
-            depth=1, max_depth=max_depth,
+            depth=1, max_depth=max_depth, state=state,
         )
 
     if sub_verify_tasks:
@@ -2008,6 +2214,53 @@ def _apply_obituary_match(
     notice.date_of_death = parsed.get("date_of_death", "")
     notice.obituary_url = url
     notice.obituary_source_type = source_type
+
+    # Read obituary-extracted maiden / also-known-as surnames (NAME-03). The
+    # values come from an untrusted LLM response, so read defensively: a
+    # missing/null/non-list value must never raise (T-03-01). Persist them on
+    # the obituary result (mirror how survivors/executor_named are read) so the
+    # downstream wiring can feed them into the name-variant generator.
+    maiden_name = (parsed.get("maiden_name", "") or "").strip()
+    also_known_as = [s for s in (parsed.get("also_known_as", []) or []) if str(s).strip()]
+    parsed["maiden_name"] = maiden_name
+    parsed["also_known_as"] = also_known_as
+
+    # Bridge the obituary-extracted name context onto the NOTICE object so the
+    # downstream PVA/deeds name search (which reads getattr(notice, ...)) can
+    # widen to the maiden/prior-married forms. Without this, the maiden_obit
+    # variant — the highest-confidence maiden source — is structurally dead in
+    # the live pipeline (PVA's first pass at Step 3d always sees None). Set
+    # defensively (only when present) so we never overwrite/clear good values
+    # and never raise inside enrichment. The flat string fields are CSV-safe
+    # (NoticeData is a flat dataclass); also_known_as is also exposed as a list
+    # attribute (decedent_also_known_as) because generate_variants expects
+    # prior_surnames to be an iterable of surname strings, NOT a delimited str.
+    if maiden_name:
+        notice.decedent_obit_maiden_name = maiden_name
+    if also_known_as:
+        notice.decedent_obit_prior_surnames = ";".join(also_known_as)
+        # List form consumed directly by PVA/deeds -> generate_variants(prior_surnames=)
+        notice.decedent_also_known_as = list(also_known_as)
+
+    # Feed the obituary-confirmed maiden / prior surnames into the resolver so
+    # the property/deeds search set includes maiden_obit + prior_married
+    # variants (NAME-03 — fixes Jackson->GREATHOUSE, which returns 0 rows under
+    # the married surname). The obituary is the highest-confidence maiden source
+    # (D-02). Persist the ordered variant values on the obituary result so
+    # Plan 04's PVA/deeds wiring can search under them. Degrade to legacy
+    # behavior (logger.warning) if the resolver is unavailable or rejects input.
+    decedent_name = notice.decedent_name or notice.owner_name or parsed.get("full_name", "")
+    if decedent_name and (maiden_name or also_known_as):
+        try:
+            from kentucky_name_resolver import generate_variants
+            variants = generate_variants(
+                decedent_name,
+                maiden_name=maiden_name or None,
+                prior_surnames=also_known_as or None,
+            )
+            parsed["name_variants"] = [v.value for v in variants]
+        except Exception as e:
+            logger.warning("  Name variant generation failed for %s: %s", decedent_name, e)
 
     if ranked_dms:
         # Deep prospecting: apply top 3 ranked decision-makers
@@ -2096,6 +2349,7 @@ def enrich_obituary_data(
     skip_dm_address: bool = False,
     tracerfy_tier1: bool = False,
     skip_ancestry: bool = False,
+    repoll_queue: dict | None = None,
 ) -> None:
     """Search for obituaries and enrich notices with deceased owner data.
 
@@ -2104,6 +2358,14 @@ def enrich_obituary_data(
       Phase B: For each confirmed deceased, verify heirs alive/dead,
                rank decision-makers, and apply joint-owner fallback
                for snippet-only matches without survivors.
+
+    Re-poll queue (Phase 6 / COVER-01): a just-filed decedent whose obituary
+    search turns up nothing may simply not be posted online yet. Instead of
+    dropping that lead, enqueue it for a delayed re-search when an opt-in
+    ``repoll_queue`` dict is passed. Only plausibly-just-not-posted-yet fresh
+    filings are enqueued — a notice whose obituary WAS found, or whose filing
+    is clearly stale, is left alone. ``repoll_queue=None`` (the default) leaves
+    behavior unchanged for existing callers/tests.
 
     Updates notices in-place.
     """
@@ -2198,7 +2460,8 @@ def enrich_obituary_data(
             skipped += 1
             continue
 
-        city = notice.city.strip() or "Knoxville"
+        city = _default_city(notice)
+        state = _default_state(notice)
         found = False
 
         for search_name in search_names[:2]:  # Primary + secondary (joint owner)
@@ -2218,8 +2481,8 @@ def enrich_obituary_data(
                 break
 
             # Run primary + no-city searches and merge results (dedup by URL)
-            results = _search_obituary(search_name, city)
-            no_city_results = _search_obituary(search_name, "")
+            results = _search_obituary(search_name, city, state=state)
+            no_city_results = _search_obituary(search_name, "", state=state)
             seen_urls = {r["url"] for r in results}
             for r in no_city_results:
                 if r["url"] not in seen_urls:
@@ -2233,7 +2496,7 @@ def enrich_obituary_data(
                 parts = search_name.split()
                 if len(parts) == 3:
                     name_no_mi = f"{parts[0]} {parts[2]}"
-                    results = _search_obituary(name_no_mi, city)
+                    results = _search_obituary(name_no_mi, city, state=state)
                     if results:
                         logger.debug(
                             "  [%d/%d] %s: fallback query (no MI) found %d results",
@@ -2248,7 +2511,7 @@ def enrich_obituary_data(
                 if first and last:
                     for variant in _get_name_variants(first):
                         nick_name = f"{variant} {last}".title()
-                        results = _search_obituary(nick_name, city)
+                        results = _search_obituary(nick_name, city, state=state)
                         if results:
                             logger.debug(
                                 "  [%d/%d] %s: nickname fallback (%s) found %d results",
@@ -2261,6 +2524,7 @@ def enrich_obituary_data(
                 results = _search_obituary(
                     search_name, city,
                     extra_terms='"death notice" OR "funeral"',
+                    state=state,
                 )
                 if results:
                     logger.debug(
@@ -2292,6 +2556,7 @@ def enrich_obituary_data(
                     city=city,
                     address=notice.address,
                     api_key=api_key,
+                    state=state,
                 )
 
                 if parsed and parsed.get("confidence") in ("high", "medium"):
@@ -2337,6 +2602,7 @@ def enrich_obituary_data(
                     city=city,
                     address=notice.address,
                     api_key=api_key,
+                    state=state,
                 )
 
                 _conf = parsed.get("confidence", "") if parsed else ""
@@ -2444,10 +2710,11 @@ def enrich_obituary_data(
                             continue
 
                         search_name = names[0]
-                        city = notice.city.strip() or "Knoxville"
+                        city = _default_city(notice)
+                        state = _default_state(notice)
 
                         result = await ancestry_enricher.lookup_deceased(
-                            page, name=search_name, city=city, state="TN"
+                            page, name=search_name, city=city, state=state,
                         )
                         if result and result.get("confirmed_deceased"):
                             notice.owner_deceased = "yes"
@@ -2473,14 +2740,15 @@ def enrich_obituary_data(
                     # Enrich Ancestry hits with DuckDuckGo obituary text for heir extraction
                     for notice, raw_name, is_tax_name, result in ancestry_match_data:
                         confirmed_name = result.get("full_name", "")
-                        city = notice.city.strip() or "Knoxville"
+                        city = _default_city(notice)
+                        state = _default_state(notice)
                         source_url = result.get("source_url", "")
                         source_type = "ancestry"
 
                         # Try DuckDuckGo search using the Ancestry-confirmed name
                         ancestry_parsed = None
                         if confirmed_name:
-                            obit_results = _search_obituary(confirmed_name, city)
+                            obit_results = _search_obituary(confirmed_name, city, state=state)
                             if obit_results:
                                 for obit_r in obit_results[:3]:
                                     page_text = _fetch_page_text(obit_r["url"])
@@ -2491,6 +2759,7 @@ def enrich_obituary_data(
                                             city=city,
                                             address=notice.address,
                                             api_key=api_key,
+                                            state=state,
                                         )
                                         if parsed and parsed.get("confidence") in ("high", "medium"):
                                             parsed["_raw_obituary_text"] = page_text
@@ -2533,6 +2802,32 @@ def enrich_obituary_data(
     elif not skip_ancestry:
         logger.debug("Ancestry: no credentials configured — skipping")
 
+    # ── Re-poll enqueue: just-filed decedents with no obituary yet ─────
+    # COVER-01 locked decision 1 — re-poll, don't drop. A candidate that never
+    # made it into `matches` had no obituary (and no Ancestry hit) and is NOT a
+    # probate-preset (those are court-named, not obituary-confirmed). When an
+    # opt-in queue is passed, enqueue such a lead for a delayed re-search instead
+    # of dropping it — but only when the data is plausibly just-not-posted-yet:
+    #   * skip notices whose obituary WAS found (matched_notices below), and
+    #   * skip clearly-stale filings (the obituary should already exist).
+    # enqueue_repoll is idempotent on an existing key (the drain in 06-03b owns
+    # attempt-bumping) and no-ops on an unkeyable lead (empty make_key).
+    if repoll_queue is not None:
+        from kcoj_repoll_queue import enqueue_repoll, make_key
+        matched_notices = {id(m[0]) for m in matches}
+        for notice, _raw_name, _is_tax_name in candidates:
+            if id(notice) in matched_notices:
+                continue  # obituary / Ancestry confirmed — not a "no obit yet" lead
+            if not _is_fresh_filing_for_repoll(notice):
+                continue  # stale filing — obituary should already exist if it ever will
+            key = make_key(notice)
+            if key:
+                enqueue_repoll(repoll_queue, key, reason="obituary_empty")
+                logger.info(
+                    "  [Obit] %s: no obituary yet — enqueued for re-poll",
+                    notice.decedent_name or notice.owner_name,
+                )
+
     # ── Phase B: Heir verification + ranked DMs + joint-owner fallback ─
 
     full_page_matches = sum(1 for _, _, _, st, *_ in matches if st == "full_page")
@@ -2552,7 +2847,8 @@ def enrich_obituary_data(
                        "ddg_people_search": 0, "inline_tracerfy": 0, "batch_tracerfy": 0}
 
     for j, (notice, parsed, url, source_type, raw_name, is_tax_name) in enumerate(matches, 1):
-        city = notice.city.strip() or "Knoxville"
+        city = _default_city(notice)
+        state = _default_state(notice)
         survivors = parsed.get("survivors", [])
         has_survivors = bool(survivors) or bool(parsed.get("executor_named", ""))
 
@@ -2584,6 +2880,7 @@ def enrich_obituary_data(
                     )
                     verification = verify_heir_status(
                         heir_name=co_owner_name, city=city, api_key=api_key,
+                        state=state,
                     )
                     co_owner_status = verification["status"]
 
@@ -2625,8 +2922,8 @@ def enrich_obituary_data(
                 "source": "probate_notice",
                 "rank": 1,
                 "street": notice.owner_street,
-                "city": notice.owner_city or "Knoxville",
-                "state": "TN",
+                "city": notice.owner_city or _default_city(notice),
+                "state": (notice.owner_state or _default_state(notice)),
                 "zip": notice.owner_zip,
             }]
             error_info = {
@@ -2658,6 +2955,7 @@ def enrich_obituary_data(
                 api_key=api_key,
                 raw_name=raw_name,
                 max_depth=max_heir_depth,
+                state=state,
             )
             error_info["heir_search_depth"] = 1
             heir_verified_count += 1
@@ -2676,6 +2974,7 @@ def enrich_obituary_data(
                     original_url=url,
                     api_key=api_key,
                     address=notice.address,
+                    state=state,
                 )
                 if new_parsed:
                     parsed = new_parsed
@@ -2690,6 +2989,7 @@ def enrich_obituary_data(
                             api_key=api_key,
                             raw_name=raw_name,
                             max_depth=max_heir_depth,
+                            state=state,
                         )
                         error_info["heir_search_depth"] = 1
                         research_dm_count += 1
@@ -2711,6 +3011,7 @@ def enrich_obituary_data(
                     city=city,
                     address=notice.address,
                     api_key=api_key,
+                    state=state,
                 )
                 if fc_parsed:
                     parsed = fc_parsed
@@ -2730,6 +3031,7 @@ def enrich_obituary_data(
                                 api_key=api_key,
                                 raw_name=raw_name,
                                 max_depth=max_heir_depth,
+                                state=state,
                             )
                             error_info["heir_search_depth"] = 1
                             error_info["missing_flags"] = error_info.get("missing_flags", [])
@@ -2748,6 +3050,7 @@ def enrich_obituary_data(
                     name=search_names[0],
                     city=city,
                     api_key=api_key,
+                    state=state,
                 )
                 if extra_survivors:
                     parsed["survivors"] = extra_survivors
@@ -2760,6 +3063,7 @@ def enrich_obituary_data(
                             api_key=api_key,
                             raw_name=raw_name,
                             max_depth=max_heir_depth,
+                            state=state,
                         )
                         error_info["heir_search_depth"] = 1
                         error_info["missing_flags"] = error_info.get("missing_flags", [])
@@ -2784,6 +3088,7 @@ def enrich_obituary_data(
                         heir_name=spouse_name,
                         city=city,
                         api_key=api_key,
+                        state=state,
                     )
                     spouse_status = verification["status"]
 
@@ -2836,6 +3141,7 @@ def enrich_obituary_data(
                             heir_name=co_owner,
                             city=city,
                             api_key=api_key,
+                            state=state,
                         )
                         spouse_status = verification["status"]
                     ranked_dms = [{
@@ -2871,8 +3177,8 @@ def enrich_obituary_data(
                 "source": "estate_fallback",
                 "rank": 1,
                 "street": notice.address,
-                "city": notice.city or "Knoxville",
-                "state": "TN",
+                "city": notice.city or _default_city(notice),
+                "state": (notice.state or _default_state(notice)),
                 "zip": notice.zip,
             }]
             error_info = {
@@ -2958,8 +3264,8 @@ def enrich_obituary_data(
                 # Tier 4: Property address fallback (DM #1 only — others left empty)
                 if dm is ranked_dms[0] and dm.get("source") != "estate_fallback":
                     dm["street"] = notice.address
-                    dm["city"] = notice.city or "Knoxville"
-                    dm["state"] = "TN"
+                    dm["city"] = notice.city or _default_city(notice)
+                    dm["state"] = (notice.state or _default_state(notice))
                     dm["zip"] = notice.zip
                     dm_addr_sources["property_fallback"] = (
                         dm_addr_sources.get("property_fallback", 0) + 1
