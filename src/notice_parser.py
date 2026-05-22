@@ -179,6 +179,13 @@ class NoticeData:
     # CourtNet case-detail enrichment (KY probate; Phase 2c)
     estate_attorney_name: str = ""       # Attorney representing the estate (party-type AP)
     courtnet_party_types: str = ""       # Pipe-separated party-type codes observed on the case (AP|FI|AD|PE|HE|...)
+    # Skip-trace death/identity guard + attorney/re-poll fallback (Phase 5; spec 2g-3/2g-4/2g-6).
+    # All str="" for CSV round-trip consistency. repoll_after is CANONICALLY DEFINED HERE — Phase 5
+    # owns it (set by plan 05-02 Task 2/Task 3); Phase 6 only DRAINS it (must not redefine/rename/retype).
+    skip_trace_guard_notes: str = ""     # Pipe/semicolon audit of suppressed/unconfirmed contacts (2g-3)
+    contact_via_attorney: str = ""       # "yes" when the estate attorney (AP) is the fallback contact channel (2g-4)
+    estate_attorney_phone: str = ""      # Phone for estate_attorney_name (AP party); paired fallback channel (2g-4)
+    repoll_after: str = ""               # YYYY-MM-DD — defensively set when credits exhausted; drained by Phase 6 (2g-6)
     # Wholesale-fit gate (Phase 4; src/wholesale_fit.py). Set by score_wholesale_fit.
     # Stored as strings for CSV round-trip consistency with every other NoticeData field.
     wholesale_fit_score: str = ""        # "0"-"100" — fit score from score_wholesale_fit (string for CSV consistency)
