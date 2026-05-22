@@ -36,6 +36,7 @@ class PipelineOptions:
     skip_entity_filter: bool = False
     skip_entity_research: bool = True   # opt-in via --research-entities
     skip_commercial_filter: bool = False
+    skip_fit_filter: bool = False       # Phase 4: wholesale-fit gate (final step)
     skip_parcel_lookup: bool = False
     skip_tax: bool = False
     skip_smarty: bool = False
@@ -171,6 +172,43 @@ def _filter_commercial(notices: list[NoticeData]) -> list[NoticeData]:
     if removed:
         logger.info("  Removed %d commercial properties", removed)
     return result
+
+
+def _filter_fit(notices: list[NoticeData]) -> list[NoticeData]:
+    """Score wholesale fit and drop the unworkable (hard-fail) leads.
+
+    Stamps wholesale_fit_score + fit_drop_reason on EVERY record. Hard-drops
+    (drop=True: no_property / out_of_estate / negative_equity / teardown) are
+    excluded — like the vacant/entity/commercial filters — with a one-line audit
+    log per drop. Soft demotions (luxury / thin-equity / sophisticated DM) are
+    KEPT with their score + reason (locked decision 1: never silently lose a lead
+    the user might still mail; the gate only governs PAID skip trace downstream).
+    """
+    from wholesale_fit import score_wholesale_fit
+
+    kept: list[NoticeData] = []
+    dropped_by_reason: dict[str, int] = {}
+    for n in notices:
+        try:
+            res = score_wholesale_fit(n)
+        except Exception as e:
+            # Resilient (CONVENTIONS.md): a scoring error keeps the record
+            # rather than crashing the run.
+            logger.warning("  Fit scoring failed for %s: %s — keeping record", n.address, e)
+            kept.append(n)
+            continue
+        n.wholesale_fit_score = str(res.score)
+        n.fit_drop_reason = res.reason
+        if res.drop:
+            dropped_by_reason[res.reason] = dropped_by_reason.get(res.reason, 0) + 1
+            logger.info("  [fit-drop] %s — %s (score %d)", n.address or n.owner_name, res.reason, res.score)
+        else:
+            kept.append(n)
+    removed = len(notices) - len(kept)
+    if removed:
+        breakdown = ", ".join(f"{k}: {v}" for k, v in sorted(dropped_by_reason.items()))
+        logger.info("  Removed %d unworkable leads before skip trace (%s)", removed, breakdown)
+    return kept
 
 
 def _compute_mailable(notices: list[NoticeData]) -> None:
@@ -773,6 +811,24 @@ def run_enrichment_pipeline(
                     "  [%s] %d record(s) — maiden retry only wired for Jefferson",
                     county_key.title(), len(group),
                 )
+
+    # ── Step 9d: Wholesale-Fit Gate (final enrichment step) ──────────
+    # Runs AFTER all enrichment that feeds the score (Zillow value @Step 8,
+    # obituary/DM @Step 9, PVA maiden-retry address @Step 9c) and BEFORE
+    # validation, mirroring the vacant/entity/commercial filter blocks. Every
+    # surviving record now carries wholesale_fit_score + fit_drop_reason; hard
+    # fails are excluded from the list handed to paid skip trace (locked
+    # decision 1 — soft demotes stay, the gate only governs PAID trace).
+    if not opts.skip_fit_filter:
+        logger.info("── Step 9d: Wholesale-Fit Gate ──")
+        before = len(notices)
+        notices = _filter_fit(notices)
+        logger.info("  %d records after fit gate", len(notices))
+        if not notices:
+            logger.warning("No records remaining after fit gate")
+            return notices
+    else:
+        logger.info("── Step 9d: Wholesale-Fit Gate (skipped) ──")
 
     # ── Step 9b: Data Validation ────────────────────────────────────
     logger.info("── Step 9b: Data Validation ──")
