@@ -399,6 +399,23 @@ async def actor_main() -> None:
             # (deceased owners, heir maps, decision makers). Basic records
             # get skip traced for free inside DataSift's unlimited plan.
             tracerfy_stats = None
+            repoll_queued = 0  # credits-exhausted records queued for Phase 6 re-poll (2g-6)
+
+            # ── Additive fit-gate safety (2g-5 coordination) ──────────────
+            # Phase 4 04-02 OWNS the PRIMARY candidate fit gate below. This thin,
+            # idempotent helper is a defensive NO-OP: True (never filters) when
+            # the fit machinery is absent OR a record is unscored, matching
+            # Phase 4's verdict when scores are present — never double-applies.
+            def _passes_fit_gate(n) -> bool:
+                thr = getattr(config, "SKIP_TRACE_MIN_FIT", None)
+                score = getattr(n, "wholesale_fit_score", None)
+                if thr is None or score in (None, "", 0):  # fit machinery absent → don't filter
+                    return True
+                try:
+                    return int(score) >= int(thr)
+                except (TypeError, ValueError):
+                    return True
+
             if do_tracerfy and config.TRACERFY_API_KEY:
                 # Fit gate (Phase 4): paid Tracerfy runs only on records at/above
                 # SKIP_TRACE_MIN_FIT, keeping the deceased/DM condition as a
@@ -410,6 +427,8 @@ async def actor_main() -> None:
                     if (int(n.wholesale_fit_score or 0) >= config.SKIP_TRACE_MIN_FIT)
                     and (n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name)
                 ]
+                # Defensive no-op on top of Phase 4's gate (no double-apply).
+                dp_for_tracerfy = [n for n in dp_for_tracerfy if _passes_fit_gate(n)]
                 if dp_for_tracerfy:
                     Actor.log.info("Running Tracerfy on %d fit DP candidates (>= SKIP_TRACE_MIN_FIT %d; %d records skipped)...",
                                    len(dp_for_tracerfy), config.SKIP_TRACE_MIN_FIT, total - len(dp_for_tracerfy))
@@ -422,6 +441,18 @@ async def actor_main() -> None:
                             tracerfy_stats["phones_found"], tracerfy_stats["emails_found"],
                             tracerfy_stats["cost"],
                         )
+                        # Salvage a credits-exhausted batch: phone-less records get
+                        # repoll_after set so Phase 6 re-polls them (2g-6, T-05-11).
+                        if tracerfy_stats.get("credits_exhausted"):
+                            Actor.log.error(
+                                "TRACERFY OUT OF CREDITS — remainder queued for re-poll."
+                            )
+                            try:
+                                from skip_trace_guard import handle_credits_exhausted
+                                ce = handle_credits_exhausted(dp_for_tracerfy, tracerfy_stats)
+                                repoll_queued = ce.get("queued", 0)
+                            except Exception as ce_e:
+                                Actor.log.warning("Credits-exhausted re-poll enqueue failed: %s", ce_e)
                     except Exception as e:
                         Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
 
@@ -583,6 +614,15 @@ async def actor_main() -> None:
                         cost_breakdown=cost_breakdown,
                     )
 
+                    # Surface the credits-exhausted re-poll count (2g-6) so the
+                    # Slack run summary reflects deferred coverage when Tracerfy
+                    # ran out of credits mid-run.
+                    if repoll_queued:
+                        _send_webhook(
+                            f"Tracerfy credits exhausted — {repoll_queued} records "
+                            f"queued for re-poll (Phase 6 will re-trace)"
+                        )
+
                     # Send DataSift CSV download links as a follow-up message
                     if datasift_csv_urls:
                         csv_lines = [
@@ -615,6 +655,13 @@ async def actor_main() -> None:
                 "Saved last_run_date + %d seen_notice_ids + %d kcoj_seen_cases to KVS for next run",
                 len(seen_ids), len(kcoj_seen_cases),
             )
+
+            if repoll_queued:
+                Actor.log.warning(
+                    "Tracerfy credits exhausted — %d records queued for re-poll "
+                    "(repoll_after set; Phase 6 will re-trace)",
+                    repoll_queued,
+                )
 
             Actor.log.info("Done — %d notices exported (%.1f min)", total, elapsed_min)
 
@@ -1999,8 +2046,26 @@ def _run_scrape_pipeline(args, searches) -> None:
     # Tracerfy batch skip trace (phones + emails for all records)
     tiers_map: dict = {}
     tracerfy_stats: dict = {}
+    repoll_queued: int = 0  # credits-exhausted records queued for Phase 6 re-poll (2g-6)
     if not getattr(args, "skip_tracerfy", False):
         import config as cfg
+
+        # ── Additive fit-gate safety (2g-5 coordination) ──────────────────
+        # Phase 4 04-02 OWNS the PRIMARY candidate fit gate below. This thin,
+        # idempotent helper is a defensive NO-OP: it returns True (never filters)
+        # when the fit machinery is absent OR a record is unscored, and matches
+        # Phase 4's verdict when scores are present — so it NEVER double-applies
+        # and keeps this plan independently shippable.
+        def _passes_fit_gate(n) -> bool:
+            thr = getattr(cfg, "SKIP_TRACE_MIN_FIT", None)
+            score = getattr(n, "wholesale_fit_score", None)
+            if thr is None or score in (None, "", 0):  # fit machinery absent → don't filter
+                return True
+            try:
+                return int(score) >= int(thr)
+            except (TypeError, ValueError):
+                return True
+
         if cfg.TRACERFY_API_KEY:
             from tracerfy_skip_tracer import batch_skip_trace
             # Fit gate (Phase 4): below-fit leads are not submitted to paid
@@ -2010,6 +2075,8 @@ def _run_scrape_pipeline(args, searches) -> None:
                 n for n in notices
                 if int(n.wholesale_fit_score or 0) >= cfg.SKIP_TRACE_MIN_FIT
             ]
+            # Defensive no-op on top of Phase 4's gate (no double-apply).
+            trace_candidates = [n for n in trace_candidates if _passes_fit_gate(n)]
             logging.info("Tracerfy fit-gate: %d/%d records >= SKIP_TRACE_MIN_FIT (%d)",
                          len(trace_candidates), len(notices), cfg.SKIP_TRACE_MIN_FIT)
             tracerfy_stats = batch_skip_trace(trace_candidates)
@@ -2018,6 +2085,14 @@ def _run_scrape_pipeline(args, searches) -> None:
                     "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
                     "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
                 )
+                # Salvage the remainder: phone-less records get repoll_after set
+                # so Phase 6 re-polls them instead of dropping them (2g-6, T-05-11).
+                try:
+                    from skip_trace_guard import handle_credits_exhausted
+                    ce = handle_credits_exhausted(trace_candidates, tracerfy_stats)
+                    repoll_queued = ce.get("queued", 0)
+                except Exception as e:
+                    logging.warning("Credits-exhausted re-poll enqueue failed: %s", e)
             logging.info(
                 "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
                 tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
@@ -2148,11 +2223,33 @@ def _run_scrape_pipeline(args, searches) -> None:
             pb_path = write_phonebook_csv(notices)
             logging.info("Phonebook CSV (%d records): %s", len(records_with_phones), pb_path)
 
+    # Run-summary surfacing for the credits-exhausted re-poll queue (2g-6).
+    # If Tracerfy ran out of credits mid-run, the phone-less remainder was
+    # queued (repoll_after set) for Phase 6 instead of being dropped — report it
+    # in the CLI/Slack run summary so the operator sees the deferred coverage.
+    if repoll_queued:
+        logging.warning(
+            "Tracerfy credits exhausted — %d records queued for re-poll "
+            "(repoll_after set; Phase 6 will re-trace)",
+            repoll_queued,
+        )
+
     # Slack/Discord notification
     if getattr(args, "notify_slack", False):
-        from slack_notifier import send_slack_notification
+        from slack_notifier import send_slack_notification, _send_webhook
 
         send_slack_notification(notices, upload_result=upload_result)
+        # Surface the credits-exhausted re-poll count as a follow-up line so the
+        # Slack run summary reflects deferred coverage (2g-6). Done here (not in
+        # slack_notifier) to keep that module out of this plan's scope.
+        if repoll_queued:
+            try:
+                _send_webhook(
+                    f"Tracerfy credits exhausted — {repoll_queued} records "
+                    f"queued for re-poll (Phase 6 will re-trace)"
+                )
+            except Exception as e:
+                logging.warning("Slack re-poll summary line failed: %s", e)
 
     # Audit DataSift for incomplete records (future daily check)
     if getattr(args, "audit_records", False):

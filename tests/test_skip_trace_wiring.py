@@ -112,6 +112,59 @@ def test_apply_contact_fallbacks_batch():
     print("PASS: test_apply_contact_fallbacks_batch")
 
 
+# ── Task 3b: credits-exhausted -> repoll + add_litigator param path ──────
+
+def test_credits_exhausted_sets_repoll():
+    """handle_credits_exhausted on a credit-drained batch sets repoll_after on
+    every phone-less notice and notes it; a notice WITH a phone is untouched."""
+    phoneless_a = NoticeData(); phoneless_a.decision_maker_name = "Heir A"
+    phoneless_b = NoticeData(); phoneless_b.decision_maker_name = "Heir B"
+    has_phone = NoticeData()
+    has_phone.decision_maker_name = "Heir C"
+    has_phone.primary_phone = "5025550000"
+
+    out = guard.handle_credits_exhausted(
+        [phoneless_a, phoneless_b, has_phone],
+        {"credits_exhausted": True},
+        days=4,
+    )
+
+    assert out["queued"] == 2, out
+    for n in (phoneless_a, phoneless_b):
+        assert _DATE_RE.match(n.repoll_after), n.repoll_after
+        assert n.repoll_after > date.today().isoformat(), n.repoll_after
+        assert "credits_exhausted" in n.skip_trace_guard_notes, n.skip_trace_guard_notes
+    assert has_phone.repoll_after == "", has_phone.repoll_after
+    print("PASS: test_credits_exhausted_sets_repoll")
+
+
+def test_credits_not_exhausted_noop():
+    """credits_exhausted False -> no-op: nothing queued, no repoll_after set."""
+    n = NoticeData(); n.decision_maker_name = "Heir D"
+
+    out = guard.handle_credits_exhausted([n], {"credits_exhausted": False})
+
+    assert out["queued"] == 0, out
+    assert n.repoll_after == "", n.repoll_after
+    print("PASS: test_credits_not_exhausted_noop")
+
+
+def test_add_litigator_param_forwarded():
+    """score_record_phones accepts add_litigator=True and returns early ({}) for a
+    phone-less batch — proves the param path is wired without any network call.
+
+    Network-free regardless of a live TRESTLE_API_KEY in the env: a batch with no
+    phones short-circuits to {} before any Trestle request is issued.
+    """
+    from phone_validator import score_record_phones
+
+    n = NoticeData(); n.decision_maker_name = "Heir E"  # no phones on the record
+    result = score_record_phones([n], add_litigator=True)
+
+    assert result == {}, f"expected early-return empty dict, got {result!r}"
+    print("PASS: test_add_litigator_param_forwarded")
+
+
 if __name__ == "__main__":
     test_attorney_fallback()
     test_aoc805_queue()
@@ -119,4 +172,7 @@ if __name__ == "__main__":
     test_unconfirmed_dm_still_falls_back()
     test_set_repoll_after_future()
     test_apply_contact_fallbacks_batch()
-    print("\nALL PASS: skip_trace_wiring (Task 2)")
+    test_credits_exhausted_sets_repoll()
+    test_credits_not_exhausted_noop()
+    test_add_litigator_param_forwarded()
+    print("\nALL PASS: skip_trace_wiring")

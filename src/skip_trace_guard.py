@@ -479,3 +479,34 @@ def apply_contact_fallbacks(notices: list) -> dict:
         agg["records"], agg["attorney"], agg["aoc805_queued"],
     )
     return agg
+
+
+def handle_credits_exhausted(notices: list, stats: dict,
+                             days: int = AOC805_REPOLL_DAYS) -> dict:
+    """Salvage a credits-exhausted Tracerfy batch (2g-6, T-05-11).
+
+    When ``stats["credits_exhausted"]`` is True, every notice that STILL has no
+    DM phone (no field in the canonical DM_PHONE_FIELDS populated) is enqueued
+    for a re-poll by setting ``repoll_after`` (reusing ``set_repoll_after``) and
+    a guard note — so the unfinished remainder is auditable and re-tried rather
+    than silently dropped. Records that DID get a phone are left untouched.
+
+    Returns ``{"queued": <count>}``. Phase 6 drains ``repoll_after``; this only
+    SETS the signal.
+    """
+    if not (stats or {}).get("credits_exhausted"):
+        return {"queued": 0}
+
+    queued = 0
+    for notice in notices or []:
+        if any((getattr(notice, f, "") or "").strip() for f in DM_PHONE_FIELDS):
+            continue  # already has a phone — nothing to salvage
+        try:
+            set_repoll_after(notice, days)
+            _append_note(notice, "credits_exhausted → repoll;")
+            queued += 1
+        except Exception:
+            logger.exception("skip_trace_guard: credits-exhausted enqueue failed for a notice")
+
+    logger.info("Credits exhausted: %d phone-less record(s) queued for re-poll", queued)
+    return {"queued": queued}
