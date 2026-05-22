@@ -2098,6 +2098,26 @@ def _apply_obituary_match(
     parsed["maiden_name"] = maiden_name
     parsed["also_known_as"] = also_known_as
 
+    # Feed the obituary-confirmed maiden / prior surnames into the resolver so
+    # the property/deeds search set includes maiden_obit + prior_married
+    # variants (NAME-03 — fixes Jackson->GREATHOUSE, which returns 0 rows under
+    # the married surname). The obituary is the highest-confidence maiden source
+    # (D-02). Persist the ordered variant values on the obituary result so
+    # Plan 04's PVA/deeds wiring can search under them. Degrade to legacy
+    # behavior (logger.warning) if the resolver is unavailable or rejects input.
+    decedent_name = notice.decedent_name or notice.owner_name or parsed.get("full_name", "")
+    if decedent_name and (maiden_name or also_known_as):
+        try:
+            from kentucky_name_resolver import generate_variants
+            variants = generate_variants(
+                decedent_name,
+                maiden_name=maiden_name or None,
+                prior_surnames=also_known_as or None,
+            )
+            parsed["name_variants"] = [v.value for v in variants]
+        except Exception as e:
+            logger.warning("  Name variant generation failed for %s: %s", decedent_name, e)
+
     if ranked_dms:
         # Deep prospecting: apply top 3 ranked decision-makers
         if len(ranked_dms) >= 1:
