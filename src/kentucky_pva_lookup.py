@@ -40,7 +40,13 @@ from bs4 import BeautifulSoup
 
 import config
 from config import REQUEST_DELAY_MAX, REQUEST_DELAY_MIN
-from kentucky_name_resolver import score_match, _search_variations
+from kentucky_name_resolver import (
+    CandidatePerson,
+    NameVariant,
+    disambiguate,
+    generate_variants,
+    score_match,
+)
 
 if TYPE_CHECKING:
     from notice_parser import NoticeData
@@ -661,23 +667,77 @@ def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
     else:
         return
 
-    # Build variations
+    # Build search variants. Non-individual holders (trust, LLC, estate) use
+    # the verbatim-string variation set; person names go through the resolver,
+    # which widens the search to maiden/prior-married/non-Anglo surname forms
+    # (NAME-01). Maiden/aka context comes from the obituary step (Plan 03);
+    # getattr falls back to None so this still works if obituary didn't run.
     if _ENTITY_NAME_RE.search(primary_target):
         variations = _entity_search_variations(primary_target)
+        variants = [
+            NameVariant(value=v, fmt="ENTITY", source="primary", confidence=1.0)
+            for v in variations
+        ]
     else:
-        variations = _search_variations(primary_target)
-    if not variations:
+        variants = generate_variants(
+            primary_target,
+            maiden_name=getattr(notice, "decedent_obit_maiden_name", None) or None,
+            prior_surnames=getattr(notice, "decedent_also_known_as", None) or None,
+        )
+    if not variants:
         return
 
     logger.info(
-        "  [PVA] Target %r [%s] -> trying variations: %r",
-        primary_target, target_source, variations,
+        "  [PVA] Target %r [%s] -> %d variants (sources: %s)",
+        primary_target, target_source, len(variants),
+        sorted({v.source for v in variants}),
     )
 
     best: tuple[float, PvaRow, str] | None = None  # (score, row, variation_used)
 
-    for query in variations:
+    # Loop variants HIGHEST-confidence-first (generate_variants returns them
+    # ordered). Break early on a strong hit — same accept thresholds as before.
+    for v in variants:
+        query = v.value
         rows = search_by_owner(session, query)
+
+        # Multi-parcel disambiguation guard (NAME-02): when a single variant
+        # returns 2+ rows that each clear the accept floor, the same name maps
+        # to multiple people/parcels. Run the corroboration guard rather than
+        # picking arbitrarily; if it can't confidently choose, leave the lookup
+        # unresolved (manual queue) — never auto-attach a wrong-person parcel.
+        scoring_rows = [
+            row for row in rows
+            if score_match(primary_target, row.owner) >= _MIN_MATCH_SCORE
+        ]
+        if len(scoring_rows) >= 2:
+            candidates = [
+                CandidatePerson(
+                    name=row.owner,
+                    addresses=[getattr(row, "address", "") or ""],
+                )
+                for row in scoring_rows
+            ]
+            known = [a for a in (notice.address.strip(),) if a]
+            picked = disambiguate(
+                primary_target, candidates,
+                known_addresses=known or None, min_score=0.6,
+            )
+            if picked is None:
+                logger.info(
+                    "  [PVA]   %d same-name parcels for %r; disambiguate "
+                    "declined -> leaving unresolved (manual queue)",
+                    len(scoring_rows), query,
+                )
+                continue
+            for row in scoring_rows:
+                if row.owner == picked.person.name:
+                    best = (picked.score, row, query)
+                    break
+            if best and best[0] >= 0.85:
+                break
+            continue
+
         for row in rows:
             score = score_match(primary_target, row.owner)
             if score >= _MIN_MATCH_SCORE and (not best or score > best[0]):
@@ -846,19 +906,22 @@ def _heir_lookup_one(session: requests.Session, notice: "NoticeData") -> None:
     if not heir:
         return
 
-    # JCD stores grantees in "LAST FIRST" already. _search_variations handles
-    # both comma and natural-order — safe to pass as-is.
-    variations = _search_variations(heir)
-    if not variations:
+    # JCD stores grantees in "LAST FIRST" already. generate_variants handles
+    # both comma and natural-order and widens to maiden/prior surname forms
+    # (NAME-01) so an heir who took title under a maiden/prior name is found.
+    variants = generate_variants(heir)
+    if not variants:
         return
 
     logger.info(
-        "  [PVA] Heir %r (transfer %s) -> trying variations: %r",
-        heir, notice.heir_transfer_date, variations,
+        "  [PVA] Heir %r (transfer %s) -> %d variants (sources: %s)",
+        heir, notice.heir_transfer_date, len(variants),
+        sorted({v.source for v in variants}),
     )
 
     best: tuple[float, PvaRow] | None = None
-    for query in variations:
+    for v in variants:
+        query = v.value
         # Skip the "ESTATE OF" variations here — we're looking for the
         # heir as a living owner, not another estate.
         if query.upper().startswith("ESTATE OF "):
