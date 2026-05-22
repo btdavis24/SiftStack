@@ -559,6 +559,13 @@ def _apply_to_notice(
     owner = detail.get("Owner") or row.owner
     if owner and not notice.tax_owner_name:
         notice.tax_owner_name = owner
+    # Persist the raw matched PVA owner string into the dedicated,
+    # test-stable classifier-input field so the trust check in
+    # kentucky_title_classifier.classify_title_path (rule 3) always has the
+    # exact matched owner string — independent of whatever else may write
+    # tax_owner_name. (Step 3d → Step 3f title-path classification.)
+    if owner and not notice.pva_owner_string:
+        notice.pva_owner_string = owner
 
     # Refine owner_status based on the actual PVA owner string. The matched
     # owner is the strongest evidence — it overrides the caller's hint.
