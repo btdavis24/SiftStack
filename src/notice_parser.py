@@ -161,6 +161,15 @@ class NoticeData:
     # Phase 2a as the primary PVA search target for the property-confirmation step.
     current_property_holder: str = ""        # Name to search PVA with (decedent / estate / trust / heir)
     current_holder_relationship: str = ""    # "self" | "trust" | "heir_recent" | "" (no deed chain)
+    # Title-path classification (KY probate; Phase 2f). Set by Step 3f
+    # (kentucky_title_classifier.classify_title_path) from the PVA owner string +
+    # latest deed (vs DOD). Decides who the real seller is BEFORE DM assignment
+    # trusts the CourtNet executor (wrong DM ~26% of cases).
+    title_path: str = ""                     # "standard_probate" | "successor_trustee" | "surviving_owner" | "out_of_estate" | "no_property" (set by Step 3f)
+    dm_can_sell_without_probate: str = ""    # "yes" | "no" | "" — trust/survivorship bypass probate
+    pva_owner_string: str = ""               # raw PVA owner string captured in Step 3d, used for trust detection
+    needs_trustee_research: str = ""         # "yes" when title_path=successor_trustee — pull Decl-of-Trust grantee chain
+    trustee_unconfirmed: str = ""            # "yes" when trust detected but successor trustee not recoverable (fall back to executor)
     # Street address extracted from the active mortgage PDF (Phase 2b OCR).
     # Used as a fallback PVA-search input when name-based PVA search misses.
     # Solves cases like married-name PVA records or middle-initial mismatches.
