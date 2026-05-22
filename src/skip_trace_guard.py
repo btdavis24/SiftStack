@@ -25,10 +25,16 @@ This is a guard layer — it does NOT reimplement Tracerfy or Trestle.
 import json
 import logging
 import re
+from datetime import date, timedelta
 
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
+
+# Business days to wait before re-polling a record that could not be contacted
+# now (no guard-passing phone, no attorney) so it can be queued for an AOC-805
+# petition pull. Phase 6 drains repoll_after; Phase 5 only SETS it (2g-4/2g-6).
+AOC805_REPOLL_DAYS = 4
 
 # Canonical DM phone-field list — single source of truth lives in phone_validator.
 # Import it; do NOT inline a 6-field subset (the full 9 fields ensure mobile_4/5
@@ -366,5 +372,110 @@ def guard_all(notices: list) -> dict:
         "death-suppressed, %d DM(s) flagged unconfirmed",
         agg["records"], agg["suppressed_phones"],
         agg["suppressed_emails"], agg["unconfirmed"],
+    )
+    return agg
+
+
+# ── Empty-trace fallback + re-poll helpers (2g-4 / 2g-6) ──────────────────
+
+
+def _today() -> date:
+    """Indirection so tests/callers reason about 'today' consistently."""
+    return date.today()
+
+
+def set_repoll_after(notice: NoticeData, days: int = AOC805_REPOLL_DAYS) -> str:
+    """Set ``notice.repoll_after`` to today + ``days`` BUSINESS days (skipping
+    Sat/Sun), as a ``YYYY-MM-DD`` string, and return it.
+
+    Idempotent: if ``repoll_after`` is already a future date, leave it untouched
+    and return the existing value. ``repoll_after`` is Phase-5-owned; Phase 6
+    drains it — this only SETS the signal (2g-4 AOC-805, 2g-6 credits).
+    """
+    today = _today()
+    existing = (getattr(notice, "repoll_after", "") or "").strip()
+    if existing:
+        try:
+            if date.fromisoformat(existing) > today:
+                return existing  # already queued for the future — leave it
+        except (ValueError, TypeError):
+            pass  # malformed -> overwrite below
+
+    d = today
+    remaining = max(0, int(days))
+    while remaining > 0:
+        d += timedelta(days=1)
+        if d.weekday() < 5:  # Mon-Fri
+            remaining -= 1
+    out = d.isoformat()
+    notice.repoll_after = out
+    return out
+
+
+def _has_guard_passing_phone(notice: NoticeData) -> bool:
+    """True if the DM has at least one guard-passing phone.
+
+    A phone is guard-passing only when a DM #1 flat phone (any field in the
+    canonical DM_PHONE_FIELDS — never a 6-field subset) survived the guard AND
+    the DM identity is NOT flagged ``unconfirmed`` (T-05-09: an unconfirmed DM
+    phone is treated as NOT contactable, so the record falls back to the
+    verified estate-attorney channel instead of dialing an unconfirmed number).
+    """
+    status = (getattr(notice, "decision_maker_status", "") or "").strip().lower()
+    if status == "unconfirmed":
+        return False
+    return any((getattr(notice, f, "") or "").strip() for f in DM_PHONE_FIELDS)
+
+
+def apply_contact_fallback(notice: NoticeData) -> str:
+    """Apply the empty-trace fallback when the DM has no guard-passing phone.
+
+    Returns the channel applied:
+      * ``""``              — none needed (DM already has a guard-passing phone),
+      * ``"attorney"``      — estate attorney (AP) flagged as the contact channel,
+      * ``"aoc805_queued"`` — neither phone nor attorney; queued for AOC-805
+                              (``repoll_after`` set; Phase 6 drains it).
+    """
+    if _has_guard_passing_phone(notice):
+        return ""
+
+    attorney = (getattr(notice, "estate_attorney_name", "") or "").strip()
+    if attorney:
+        notice.contact_via_attorney = "yes"
+        # The attorney phone may be empty here — the CHANNEL is what matters;
+        # downstream marketing routes via the attorney.
+        _append_note(notice, "fallback=attorney (no guard-passing DM phone);")
+        logger.info("  Fallback: route via estate attorney %s (no DM phone)", attorney)
+        return "attorney"
+
+    # No phone AND no attorney -> queue for an AOC-805 petition pull.
+    set_repoll_after(notice)
+    _append_note(notice, "fallback=aoc805_queued (no phone, no attorney);")
+    logger.info("  Fallback: queued for AOC-805 re-poll after %s (no phone, no attorney)",
+                notice.repoll_after)
+    return "aoc805_queued"
+
+
+def apply_contact_fallbacks(notices: list) -> dict:
+    """Run ``apply_contact_fallback`` over a list; aggregate per-channel counts.
+
+    Returns ``{records, attorney, aoc805_queued}`` and logs a one-line summary.
+    """
+    agg = {"records": 0, "attorney": 0, "aoc805_queued": 0}
+    for notice in notices or []:
+        try:
+            ch = apply_contact_fallback(notice)
+        except Exception:
+            logger.exception("skip_trace_guard: contact fallback failed for a notice")
+            continue
+        agg["records"] += 1
+        if ch == "attorney":
+            agg["attorney"] += 1
+        elif ch == "aoc805_queued":
+            agg["aoc805_queued"] += 1
+
+    logger.info(
+        "Contact fallback: %d record(s) — %d via attorney, %d queued for AOC-805",
+        agg["records"], agg["attorney"], agg["aoc805_queued"],
     )
     return agg
