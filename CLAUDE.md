@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## GSD Planning Workflow
+
+This project uses the GSD (`/gsd-*`) workflow for the **KY Probate & Lis Pendens Automation** milestone. Planning artifacts live in `.planning/` (gitignored — local-only):
+
+- `.planning/ROADMAP.md` — 7 phases, each aligned 1:1 with a buildable spec in `docs/`
+- `.planning/REQUIREMENTS.md` — 19 REQ-IDs (NAME/TITLE/EQUITY/CONTACT/FIT/COVER/LP) traced to phases
+- `.planning/codebase/` — codebase map (STACK, ARCHITECTURE, STRUCTURE, CONVENTIONS, TESTING, INTEGRATIONS, CONCERNS)
+- `.planning/PROJECT.md`, `.planning/STATE.md` — project context + current status
+
+**Phase → spec mapping** (plan each with `/gsd-plan-phase N --prd docs/<spec>.md`):
+1 Name resolver (`phase_2e`) · 2 Title-path (`phase_2f`) · 3 Lien-sweep equity (`phase_2` §2d) · 4 Fit gate (`phase_2h`) · 5 Skip-trace+guard (`phase_2g`) · 6 Re-poll+no-probate (`phase_2j`) · 7 Lis pendens on Apify (`phase_3`).
+
+Evidence base: `docs/probate_enrichment_lessons.md` (128-case review). This milestone is a correctness/coverage **layer** over the already-shipped happy-path pipeline — audit existing `src/` modules against the tightened specs before building.
+
 ## Project Overview
 
 **SiftStack** — Full-stack real estate investing operations platform built around DataSift.ai CRM. Covers the entire REI business lifecycle:
@@ -54,6 +68,45 @@ python src/main.py dropbox-watch --no-delete                      # keep photos 
 
 All source files are in `src/` and imports assume `src/` is the working directory. Run from project root with `python src/main.py` or set `PYTHONPATH=src`.
 
+## Deep Prospecting Workflow (single property)
+
+**Always use the pipeline. Do NOT hand-roll one-off recon scripts as the deliverable.** The point of having `deep_prospector.py` + `report_generator.py` is for them to produce the structured Excel + branded PDF every time.
+
+### Canonical sequence
+
+1. **Discovery — fill the NoticeData CSV row** (raw recon scripts feed this; they are NOT the deliverable):
+   - **PVA detail (KY):** `kentucky_pva_lookup.search_by_address()` + `get_detail()` — owner, parcel_id, lrsn, assessed value, deed book/page, year built, sqft, baths
+   - **Probate (KY):** `kcoj_case_detail.login_as_guest()` + `search_case()` / party search — case number, decedent, executor (P/EE), attorney (AP), party-type graph
+   - **Mortgage history (KY):** `jefferson_deeds_scraper._search_names_unique()` + `_fetch_deed_list()` + `_fetch_pdetail()` — open mortgages, releases, original principal, lien chain
+   - **Obituary:** `obituary_enricher` (TN) or WebSearch + WebFetch for KY — DOD, surviving spouse/heirs, predeceased, pets/charities (DOD sanity check: reject obit > 3yrs older than filing date)
+   - **One-off recon scripts** at `scripts/find_<lastname>_*.py` are fine for raw discovery, but their output goes INTO the CSV — they are not the final report
+
+2. **Pipeline — run the orchestrator:**
+   ```bash
+   python src/main.py deep-prospect --csv-path output/<name>_recon/<name>_record.csv --depth 3
+   # Produces: output/deep_prospecting_L3_<timestamp>.xlsx
+   ```
+
+3. **PDF deliverable:**
+   ```python
+   from report_generator import generate_record_pdf
+   from notice_parser import NoticeData
+   # Load CSV row into NoticeData, then:
+   generate_record_pdf(notice, output_dir=Path("output/reports"))
+   # Produces: output/reports/<address_slug>_<date>.pdf
+   ```
+
+### NoticeData fields to populate for a probate prospect (minimum)
+
+`address, city, state, zip, owner_name, notice_type=probate, county, decedent_name, date_of_death, owner_deceased=yes, obituary_url, decision_maker_name, decision_maker_relationship, decision_maker_status=verified_living, decision_maker_source, decision_maker_street/city/state/zip, parcel_id, estimated_value, year_built, bathrooms, bedrooms, sqft, lot_size, case_number, estate_attorney_name, courtnet_party_types, mortgage_origination_date, mortgage_original_amount, mortgage_balance_estimate, heirs_verified_living, heirs_verified_deceased, signing_chain_count, signing_chain_names, dm_confidence, dm_confidence_reason, property_owner_status, deceased_indicator`
+
+See `notice_parser.NoticeData` for the full ~60-field schema.
+
+### What deep-prospect DOES NOT do
+
+- **Skip trace (Tracerfy + Trestle phone scoring) is NOT auto-invoked by `deep-prospect`.** Level 1 only checks if phone fields are already populated. To actually pull phones for the DM, run Tracerfy separately (it normally runs during the daily scrape pipeline) or do a manual TruePeopleSearch / FastPeopleSearch / Radaris waterfall.
+- DataSift upload — separate `--upload-datasift` flag on the daily/historical commands
+
 ## Architecture
 
 **Data flows:**
@@ -94,7 +147,7 @@ Filterable via `--counties` and `--types` CLI args (comma-separated, or omit for
 ## Key Domain Rules
 
 - **Foreclosure filtering is critical.** Not all notices from "Foreclosure" saved searches are actual foreclosures. The scraper parses each notice's full text and only includes ones with trustee sale language. See `INCLUDE_PHRASES` / `EXCLUDE_PHRASES` in `foreclosure_filter.py`.
-- **Probate owner_name** should be the Personal Representative/Executor/Administrator — not the deceased.
+- **Probate decision-maker is title-path-dependent (never the deceased).** The DM is the Personal Representative/Executor/Administrator for **standard probate**, but the **successor trustee** when the deed shows a revocable/living trust (the trust can sell without closing probate), and the **surviving owner** when the deed is joint/survivorship (the survivor bypasses probate). The CourtNet executor must NOT overwrite a title-derived DM for trust/survivorship, and for out-of-estate/no-property no DM is named. See `src/kentucky_title_classifier.py` (`classify_title_path` → `title_path`) and the title-aware DM branch in `kcoj_case_detail.apply_parties_to_notice`.
 - **Owner names** in foreclosure notices typically appear after "executed by" in the deed of trust language.
 - **Rate limiting:** 2-3 second random delays between requests, 3 retries per page.
 - **Address dedup:** Same property can appear in multiple notices; `data_formatter.deduplicate()` keeps the most recent.
