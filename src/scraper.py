@@ -684,6 +684,66 @@ def save_captcha_failed_ids(failed: dict[str, dict]) -> None:
     config.save_state(CAPTCHA_FAILED_IDS_FILE, failed)
 
 
+# ── Re-poll queue drain (Phase 6 / COVER-01, locked decision 2) ──────
+# Drain the re-poll queue at the START of each daily run, BEFORE the new
+# scrape, so re-found cases flow through the SAME enrichment path as fresh
+# ones (one code path). This is a MODULE-LEVEL standalone function (not
+# inlined in scrape_all) so it can be unit-tested directly with a mocked
+# CourtNet and zero network.
+
+
+async def drain_repoll_queue(repoll_queue: dict, page=None) -> list[NoticeData]:
+    """Re-search every DUE re-poll entry at the START of the daily run.
+
+    For each key whose ``repoll_after <= today`` (06-01 ``due_entries``):
+      * reconstruct a minimal probate NoticeData from the key (case_number when
+        the key looks like a docket number, else ``decedent|date``),
+      * re-run the CourtNet party lookup via the SAME ``enrich_case_parties``
+        path used for fresh cases — passing ``repoll_queue=None`` so the drain's
+        own re-search does NOT re-enqueue mid-drain (the drain owns the bump),
+      * on a HIT (owner_name filled OR a non-empty courtnet_party_types), stamp
+        ``repoll_attempts`` from the entry, remove the key, and append the
+        re-found notice to the returned list,
+      * on a still-empty MISS, ``bump_or_drop`` the entry (attempts++ / drop at
+        max with an audit note).
+
+    Returns the re-found notices for ``scrape_all`` to merge into all_notices.
+    The CALLER persists the (mutated) queue. Each per-entry re-search is wrapped
+    in try/except so one bad entry can never abort the run or the rest of the
+    drain (threat T-06-07); a poisoned key yields 0 parties and is bumped/dropped,
+    not amplified (threat T-06-08)."""
+    from kcoj_repoll_queue import due_entries, bump_or_drop
+    from kcoj_case_detail import enrich_case_parties
+    import re as _re
+
+    refound: list[NoticeData] = []
+    due = due_entries(repoll_queue)
+    logger.info("Re-poll queue: %d due / %d total", len(due), len(repoll_queue))
+    for key in list(due):
+        entry = repoll_queue.get(key, {})
+        try:
+            # enrich_case_parties only acts on probate/Jefferson candidates with a
+            # case_number, so reconstruct the minimal shape it filters on.
+            notice = NoticeData(notice_type="probate", county="Jefferson", state="KY")
+            if _re.match(r"\d{2}-[A-Z]{1,3}-\d+", key):
+                notice.case_number = key
+            else:
+                notice.decedent_name = key.split("|", 1)[0]
+            # repoll_queue=None: the drain owns the bump; do NOT re-enqueue mid-drain.
+            await enrich_case_parties([notice], repoll_queue=None)
+            if notice.owner_name.strip() or notice.courtnet_party_types.strip():
+                setattr(notice, "repoll_attempts", str(entry.get("attempts", 0)))
+                repoll_queue.pop(key, None)
+                refound.append(notice)
+                logger.info("Re-poll HIT: %s re-found and merged", key)
+            else:
+                status = bump_or_drop(repoll_queue, key)
+                logger.info("Re-poll miss (%s): %s", status, key)
+        except Exception as e:
+            logger.warning("Re-poll drain error on %s: %s — leaving entry", key, e)
+    return refound
+
+
 # ── Main Entry Point ─────────────────────────────────────────────────
 
 
@@ -701,6 +761,8 @@ async def scrape_all(
     kcoj_seen_cases: dict[str, str] | None = None,
     on_search_complete=None,
     on_kcoj_search_complete=None,
+    repoll_queue: dict | None = None,
+    on_repoll_complete=None,
 ) -> list[NoticeData]:
     """Main entry point for scraping.
 
@@ -757,6 +819,26 @@ async def scrape_all(
         logger.info("Historical mode: pulling notices since %s", since_date)
 
     all_notices: list[NoticeData] = []
+
+    # ── Re-poll queue drain (Phase 6 / COVER-01, locked decision 2) ─────
+    # Drain the queue at the START of the run, BEFORE the per-source scrape
+    # loop, so re-found cases flow through the SAME downstream enrichment as
+    # fresh ones. Re-found notices are merged FIRST: data_formatter.deduplicate
+    # keeps the most recent, and a re-found case is OLDER than a same-day fresh
+    # dup, so prepending them does not corrupt dedup. Persistence mirrors the
+    # kcoj_seen_cases pattern (local save + KVS callback) and is wrapped in the
+    # same try/except shape so a persist failure cannot abort the run.
+    from kcoj_repoll_queue import load_repoll_queue, save_repoll_queue
+    if repoll_queue is None:
+        repoll_queue = load_repoll_queue()
+    refound = await drain_repoll_queue(repoll_queue)
+    all_notices.extend(refound)
+    try:
+        save_repoll_queue(repoll_queue)
+        if on_repoll_complete is not None:
+            await on_repoll_complete(repoll_queue)
+    except Exception as e:
+        logger.warning("Re-poll queue persist failed: %s", e)
 
     # ── Split searches by source ───────────────────────────────────────
     jcd_searches = [s for s in searches if getattr(s, "source", "tnpn") == "jcd"]
