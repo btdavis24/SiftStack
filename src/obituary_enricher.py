@@ -1402,21 +1402,123 @@ def _batch_tracerfy_lookup(notices: list) -> None:
         logger.warning("Tracerfy batch lookup failed: %s", e)
 
 
+def _lookup_dm_address_ky(name: str, city: str, api_key: str) -> dict | None:
+    """KY (Jefferson) address waterfall for a DM/heir, mirroring the TN tier shape.
+
+    Builds owner-search variants for ``name`` via the Phase 1 resolver (imported
+    DEFENSIVELY), then searches the Jefferson PVA by owner until a parcel with a
+    non-empty address comes back. Maps the PvaRow -> the standard address dict.
+    Returns None on a PVA miss so the caller's existing national people-search
+    tier can still try (that path already works nationally).
+    """
+    if not name or not name.strip():
+        return None
+
+    # Phase 1 variant generator — defensive import; fall back to [name].
+    try:
+        from kentucky_name_resolver import generate_variants
+    except ImportError:
+        generate_variants = None
+
+    variants: list[str] = []
+    if generate_variants is not None:
+        try:
+            for v in generate_variants(name):
+                if v.value and v.value not in variants:
+                    variants.append(v.value)
+        except Exception as e:  # never crash the waterfall on a variant bug
+            logger.debug("KY variant generation failed for %s: %s", name, e)
+    if not variants:
+        # Fall back to the raw name plus a LAST FIRST flip (PVA is owner-indexed).
+        parts = name.split()
+        variants = [name]
+        if len(parts) >= 2:
+            flipped = f"{parts[-1]} {' '.join(parts[:-1])}"
+            if flipped not in variants:
+                variants.append(flipped)
+
+    # Lazy/local import to avoid a hard module cycle.
+    try:
+        import kentucky_pva_lookup as pva
+    except ImportError as e:
+        logger.debug("kentucky_pva_lookup unavailable for KY DM lookup: %s", e)
+        return None
+
+    try:
+        session = requests.Session()
+    except Exception as e:
+        logger.debug("Could not open PVA session for %s: %s", name, e)
+        return None
+
+    for variant in variants:
+        try:
+            rows = pva.search_by_owner(session, variant)
+        except Exception as e:
+            logger.debug("PVA search_by_owner failed for %r: %s", variant, e)
+            continue
+        for row in rows or []:
+            addr = (getattr(row, "address", "") or "").strip()
+            if addr:
+                logger.info("    Tier 1 (KY PVA): %s [%s]", addr, variant)
+                return {
+                    "street": addr,
+                    "city": city or "Louisville",
+                    "state": "KY",
+                    "zip": "",
+                    "source": "ky_pva",
+                }
+
+    return None
+
+
 def _lookup_dm_address(
     name: str, city: str, api_key: str, tracerfy_tier1: bool = False,
+    state: str = "",
 ) -> dict:
-    """Look up decision-maker's mailing address using tiered sources.
+    """Look up decision-maker's mailing address using tiered, market-aware sources.
 
     Tier 0 (opt-in): Tracerfy skip tracing (paid, highest hit rate)
-    Tier 1: Knox County Tax API (free, fast, Knox only)
+    Tier 1 (KY): Jefferson PVA owner search (when state == "KY")
+    Tier 1 (TN/Knox): Knox County Tax API (free, fast, Knox only)
     Tier 2: Serper.dev + Firecrawl + LLM (cheap, national)
     Tier 2b: DuckDuckGo fallback (free, unreliable -- used when Serper not configured)
 
+    The ``state`` hint (default "" preserves all existing TN/Knox callers)
+    dispatches the free property tier: KY -> PVA, everything else -> Knox Tax.
     Returns {street, city, state, zip, source} (may have empty values).
     """
     result = {"street": "", "city": "", "state": "", "zip": "", "source": ""}
 
     if not name or not name.strip():
+        return result
+
+    # Tier 1 (KY): Jefferson PVA owner search. KY notices must NOT fall through
+    # to the Knox Tax tier (TN-only) — on a PVA miss, drop straight to the
+    # national web tiers below.
+    if state.strip().upper() == "KY":
+        ky_result = _lookup_dm_address_ky(name, city, api_key)
+        if ky_result and ky_result.get("street"):
+            result.update(ky_result)
+            return result
+        # fall through to Tier 2 web search (national) — NOT Knox Tax.
+        import config as cfg
+        sf_result = _lookup_dm_address_serper_firecrawl(
+            name, city or "Louisville", api_key
+        )
+        if sf_result and sf_result.get("street"):
+            result.update(sf_result)
+            result["source"] = "people_search"
+            logger.info("    Tier 2 (People Search): %s, %s",
+                        result["street"], result["city"])
+            return result
+        if not cfg.SERPER_API_KEY and not cfg.FIRECRAWL_API_KEY:
+            web_result = _lookup_dm_address_web(name, city or "Louisville", api_key)
+            if web_result and web_result.get("street"):
+                result.update(web_result)
+                result["source"] = "ddg_people_search"
+                logger.info("    Tier 2b (DDG): %s, %s",
+                            result["street"], result["city"])
+                return result
         return result
 
     # Tier 0 (opt-in): Tracerfy as primary lookup
