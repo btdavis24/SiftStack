@@ -2098,6 +2098,23 @@ def _apply_obituary_match(
     parsed["maiden_name"] = maiden_name
     parsed["also_known_as"] = also_known_as
 
+    # Bridge the obituary-extracted name context onto the NOTICE object so the
+    # downstream PVA/deeds name search (which reads getattr(notice, ...)) can
+    # widen to the maiden/prior-married forms. Without this, the maiden_obit
+    # variant — the highest-confidence maiden source — is structurally dead in
+    # the live pipeline (PVA's first pass at Step 3d always sees None). Set
+    # defensively (only when present) so we never overwrite/clear good values
+    # and never raise inside enrichment. The flat string fields are CSV-safe
+    # (NoticeData is a flat dataclass); also_known_as is also exposed as a list
+    # attribute (decedent_also_known_as) because generate_variants expects
+    # prior_surnames to be an iterable of surname strings, NOT a delimited str.
+    if maiden_name:
+        notice.decedent_obit_maiden_name = maiden_name
+    if also_known_as:
+        notice.decedent_obit_prior_surnames = ";".join(also_known_as)
+        # List form consumed directly by PVA/deeds -> generate_variants(prior_surnames=)
+        notice.decedent_also_known_as = list(also_known_as)
+
     # Feed the obituary-confirmed maiden / prior surnames into the resolver so
     # the property/deeds search set includes maiden_obit + prior_married
     # variants (NAME-03 — fixes Jackson->GREATHOUSE, which returns 0 rows under
