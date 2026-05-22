@@ -522,12 +522,21 @@ def apply_parties_to_notice(notice: NoticeData, parties: list[dict]) -> None:
 # ── Public entry point ────────────────────────────────────────────────
 
 
-async def enrich_case_parties(notices: list[NoticeData]) -> None:
+async def enrich_case_parties(
+    notices: list[NoticeData],
+    repoll_queue: dict | None = None,
+) -> None:
     """Populate owner_name / estate_attorney_name on Jefferson probate
     records that have a case_number.
 
     Solves the reCAPTCHA once, then iterates all candidates in a single
     browser session.
+
+    Re-poll queue (Phase 6 / COVER-01): a just-filed case whose CourtNet
+    search returns 0 parties is not yet indexed — instead of silently
+    dropping it, enqueue it for re-search after a short delay when an
+    opt-in ``repoll_queue`` dict is passed. ``repoll_queue=None`` (the
+    default) leaves behavior unchanged for existing callers/tests.
     """
     candidates = [
         n for n in notices
@@ -588,6 +597,27 @@ async def enrich_case_parties(notices: list[NoticeData]) -> None:
                         "  [CourtNet] case %s: %d part(y/ies) parsed",
                         notice.case_number, len(parties),
                     )
+                    # Re-poll, don't drop, a fresh 0-row case (COVER-01 locked
+                    # decision 1). When an opt-in queue is passed and the case is
+                    # docket-known (has a case_number to re-search by), enqueue it
+                    # for a delayed re-search instead of leaving it silently empty.
+                    # enqueue_repoll is idempotent on an existing key (the drain in
+                    # 06-03b owns attempt-bumping), so re-enqueuing never resets
+                    # progress toward the max-attempts cap.
+                    if (
+                        not parties
+                        and repoll_queue is not None
+                        and notice.case_number.strip()
+                    ):
+                        from kcoj_repoll_queue import enqueue_repoll, make_key
+                        enqueue_repoll(
+                            repoll_queue, make_key(notice),
+                            reason="courtnet_0_parties",
+                        )
+                        logger.info(
+                            "  [CourtNet] case %s: 0 parties — enqueued for re-poll",
+                            notice.case_number,
+                        )
                     consecutive_failures = 0
                 except Exception as exc:
                     consecutive_failures += 1
