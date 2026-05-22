@@ -8,6 +8,7 @@ last_run.json
 seen_ids.json
 captcha_failed_ids.json
 kcoj_seen_cases.json
+jcd_seen_instruments.json
 kcoj_repoll_queue.json
 .ancestry_page_loads.json
 cookies.json

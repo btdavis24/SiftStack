@@ -179,6 +179,7 @@ apify push
 - `counties` / `types`: arrays to filter saved searches (empty = all)
 - `tn_username`, `tn_password`, `captcha_api_key`: secrets (required)
 - `google_drive_folder_id`, `google_service_account_key`: optional Google Drive upload
+- **`types`, lis pendens, and probate:** the schema default `types` is `["foreclosure"]` only. To run Jefferson County KY lis pendens AND Kentucky probate (KCOJ) on the daily schedule, the Apify schedule must set `types` explicitly to list them, e.g. `["foreclosure", "lis_pendens", "probate"]`. Cross-run dedup is per-source: JCD lis-pendens dedup persists in the Apify Key-Value Store under the `jcd_seen_instruments` key (instrument-key → first-seen date), and KCOJ probate dedup persists under the `kcoj_seen_cases` key (case-number → first-seen date; pre-existing). Both parallel each other so daily re-runs do not re-push the same filings — JCD additionally skips the PDF/OCR fetch for already-seen instruments.
 
 ### Actor Output
 - **Dataset**: structured records pushed via `Actor.push_data()`
@@ -201,6 +202,7 @@ Courthouse terminal photos → OCR → LLM parse → enrichment → DataSift. Ru
 - `eviction` — plaintiff = landlord (target contact), defendant = tenant
 - `code_violation` — owner of record, violation type, compliance deadline
 - `divorce` — petitioner + respondent, property from schedule page
+- `lis_pendens` — **JCD-source (Jefferson County KY deeds) notice type, additional to the 7 photo-pipeline types above** — pre-foreclosure court filing scraped via `jefferson_deeds_scraper.py` (not the courthouse-photo pipeline). Maps to the DataSift "Pre-Foreclosure" list.
 
 ### Critical OCR Patterns (hard-won from live testing)
 
@@ -278,7 +280,7 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 DataSift's niche sequential system uses filter presets to guide records through SMS → Call → Mail → Deep Prospecting phases. Two preset folders: "00 Niche Sequential Marketing" (12 presets, courthouse data) and "01. Bulk Sequential Marketing" (9 presets, bulk data). All 21 presets exclude Sold status (build 1.0.23). A "Sold Property Cleanup" sequence in the Transactions folder auto-fires on "Sold" tag to change status, remove from lists, clear tasks, and clear assignee.
 
 - **"Courthouse Data" tag:** Every record gets this tag — signals first-to-market county data (prioritized over bulk data in filter presets)
-- **Lists column:** Maps `notice_type` → DataSift list name (`foreclosure` → "Foreclosure", `probate` → "Probate", `tax_sale` → "Tax Sale", `tax_delinquent` → "Tax Delinquent", `eviction` → "Eviction", `code_violation` → "Code Violation", `divorce` → "Divorce"). DataSift auto-creates lists from CSV.
+- **Lists column:** Maps `notice_type` → DataSift list name (`foreclosure` → "Foreclosure", `probate` → "Probate", `tax_sale` → "Tax Sale", `tax_delinquent` → "Tax Delinquent", `eviction` → "Eviction", `code_violation` → "Code Violation", `divorce` → "Divorce", `lis_pendens` → "Pre-Foreclosure"). DataSift auto-creates lists from CSV.
 - **Tags:** Courthouse Data, notice_type, county, YYYY-MM date, deceased/living, DM confidence level, has_auction, tax_delinquent, photo_import (for photo-sourced records)
 
 ### Upload Wizard (5 Steps)
@@ -516,7 +518,7 @@ These values are identical across all skills that reference them:
 - **Comp adjustments:** Bedroom $5,000, Bathroom $7,500, $/sqft $85, Age $500/yr (from `comp_analyzer.py`)
 - **Financing defaults:** HML 12%, conventional 7%, 2 points, 2.5% closing (from `deal_analyzer.py`)
 - **DOD sanity:** MAX_DOD_GAP_YEARS = 3 (from `obituary_enricher.py`)
-- **Notice types:** 7 total (foreclosure, tax_sale, tax_delinquent, probate, eviction, code_violation, divorce)
+- **Notice types:** 7 photo-pipeline types (foreclosure, tax_sale, tax_delinquent, probate, eviction, code_violation, divorce) + `lis_pendens` (JCD/Jefferson-deeds source, additional to the 7)
 
 ### Key Corrections Made During Optimization (April 2026)
 - **Hardcoded credentials removed** from sift-market-research (had email/password in SKILL.md)
