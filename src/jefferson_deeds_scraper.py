@@ -565,6 +565,7 @@ def scrape_jefferson_deeds(
     notice_type: str = "lis_pendens",
     county: str = "Jefferson",
     fetch_details: bool = True,
+    seen_instruments: dict[str, str] | None = None,
 ) -> list[NoticeData]:
     """Scrape LIS PENDENS filings from Jefferson County Clerk online records.
 
@@ -577,6 +578,12 @@ def scrape_jefferson_deeds(
                        each record and extract the full street address from
                        page 2.  Set False to skip document fetches and rely
                        only on the legal description from the hit list.
+        seen_instruments: Cross-run dedup cache (instrument-key → first-seen
+                       YYYY-MM-DD). When provided, instruments already present
+                       are skipped BEFORE the PDF fetch (no OCR cost) and newly
+                       emitted instruments are added after their NoticeData is
+                       appended. When None (default), no gating — behavior is
+                       identical to before this parameter existed.
 
     Returns:
         List of NoticeData objects, one per LIS PENDENS filing.
@@ -618,7 +625,16 @@ def scrape_jefferson_deeds(
     logger.info("JCD: %d LP filings found", len(records))
 
     notices: list[NoticeData] = []
+    today_str = datetime.now().strftime("%Y-%m-%d")
     for i, rec in enumerate(records):
+        # Cross-run dedup gate: skip already-seen instruments BEFORE the PDF
+        # fetch so the _delay() + _fetch_address_from_document OCR cost is never
+        # paid for a filing we already emitted on a prior run (locked decision 3).
+        key = _instrument_key(rec["instnum"], rec["year"], rec["db"])
+        if seen_instruments is not None and key in seen_instruments:
+            logger.debug("JCD: skip already-seen instrument %s", key)
+            continue
+
         logger.info(
             "JCD: [%d/%d] %s — %s",
             i + 1, len(records), rec["grantor"], rec["legal_desc"],
@@ -661,6 +677,8 @@ def scrape_jefferson_deeds(
             parcel_id=parcel_id_found or rec["case_num"],
         )
         notices.append(notice)
+        if seen_instruments is not None:
+            seen_instruments[key] = today_str   # mark seen AFTER successful build (locked decision 4)
 
     logger.info("JCD: returning %d LIS PENDENS notices", len(notices))
     return notices
