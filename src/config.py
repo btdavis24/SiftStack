@@ -30,6 +30,11 @@ PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
 # by case_number keeps DataSift uploads from duplicating on the daily Apify run.
 KCOJ_SEEN_CASES_FILE = PROJECT_ROOT / "kcoj_seen_cases.json"
 KCOJ_SEEN_CASES_PRUNE_DAYS = 90
+# Jefferson County Deeds (JCD) lis pendens recur in the rolling daily window;
+# cross-run dedup by recorded-instrument key keeps the daily Apify run from
+# re-pushing the same LP filings (and re-paying the PDF/OCR cost — see 3b).
+JCD_SEEN_FILE = PROJECT_ROOT / "jcd_seen_instruments.json"
+JCD_SEEN_PRUNE_DAYS = 120   # LP filings resolve faster than probate; covers the rolling window + slack
 # Re-poll queue (Phase 6 / COVER-01): fresh CourtNet/obit filings that
 # return 0 rows are enqueued here and re-searched after a delay instead of
 # being dropped. Mirrors the kcoj_seen_cases plumbing; different key.

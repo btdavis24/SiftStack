@@ -36,6 +36,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+import config
 from kentucky_name_resolver import SUFFIX_RE, generate_variants
 from notice_parser import NoticeData
 
@@ -520,6 +521,39 @@ def last_n_business_days(n: int) -> tuple[str, str]:
         if current.weekday() < 5:  # Mon=0 … Fri=4
             days_counted += 1
     return current.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+
+
+# ── Cross-run dedup ───────────────────────────────────────────────────
+# JCD lis pendens recur in the rolling daily window; without dedup the daily
+# Apify run re-pushes the same LP filings (and re-pays the PDF/OCR cost). The
+# natural key is the recorded instrument (instnum/year/db) — globally unique
+# in JCD. Mirrors the KCOJ probate seen-case cache (kcoj_scraper.py:58-79),
+# swapping the case-number key for the instrument key. Value = YYYY-MM-DD the
+# instrument was first emitted, used only for pruning.
+
+
+def _instrument_key(instnum: str, year: str, db: str) -> str:
+    """Stable dedup key per recorded instrument (globally unique in JCD)."""
+    return f"{instnum}-{year}-{db}"
+
+
+def load_jcd_seen() -> dict[str, str]:
+    """Load previously-emitted instrument keys, pruning entries older than
+    config.JCD_SEEN_PRUNE_DAYS. Value = YYYY-MM-DD first-emitted date."""
+    from datetime import timedelta
+    data = config.load_state(config.JCD_SEEN_FILE)
+    if not data:
+        return {}
+    cutoff = (datetime.now() - timedelta(days=config.JCD_SEEN_PRUNE_DAYS)).strftime("%Y-%m-%d")
+    pruned = {k: d for k, d in data.items() if d >= cutoff}
+    if len(pruned) < len(data):
+        logger.info("JCD: pruned %d instruments older than %d days",
+                    len(data) - len(pruned), config.JCD_SEEN_PRUNE_DAYS)
+    return pruned
+
+
+def save_jcd_seen(seen: dict[str, str]) -> None:
+    config.save_state(config.JCD_SEEN_FILE, seen)
 
 
 # ── Main scraper ──────────────────────────────────────────────────────
