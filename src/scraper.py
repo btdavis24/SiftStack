@@ -763,6 +763,8 @@ async def scrape_all(
     on_kcoj_search_complete=None,
     repoll_queue: dict | None = None,
     on_repoll_complete=None,
+    jcd_seen: dict[str, str] | None = None,
+    on_jcd_search_complete=None,
 ) -> list[NoticeData]:
     """Main entry point for scraping.
 
@@ -906,7 +908,21 @@ async def scrape_all(
 
     # ── Jefferson County Deeds (HTTP-only, no browser) ─────────────────
     if jcd_searches:
-        from jefferson_deeds_scraper import last_n_business_days, scrape_jefferson_deeds
+        from jefferson_deeds_scraper import (
+            last_n_business_days,
+            scrape_jefferson_deeds,
+            load_jcd_seen,
+            save_jcd_seen,
+        )
+
+        # JCD has its own cross-run dedup cache (instrument-key → first-seen),
+        # mirroring kcoj_seen_cases. LP filings recur in the rolling daily
+        # window; without this, a daily Apify run re-pushes the same instruments
+        # (and re-pays the PDF/OCR cost). Caller (Apify) can pre-load from KVS
+        # and pass its own dict; CLI runs fall back to the local JSON file.
+        if jcd_seen is None:
+            jcd_seen = load_jcd_seen()
+        logger.info("JCD cross-run dedup: %d previously-emitted instruments loaded", len(jcd_seen))
 
         for search in jcd_searches:
             # Determine date range for this JCD search
@@ -929,6 +945,7 @@ async def scrape_all(
                     end_date=end,
                     notice_type=search.notice_type,
                     county=search.county,
+                    seen_instruments=jcd_seen,
                 )
                 all_notices.extend(jcd_notices)
                 if on_batch and jcd_notices:
@@ -937,9 +954,15 @@ async def scrape_all(
                 logger.exception("JCD scrape failed: %s", search.saved_search_name)
 
             try:
+                # Local file persistence — harmless no-op in Apify where the
+                # filesystem is ephemeral (the real backing store is KVS via
+                # on_jcd_search_complete below).
+                save_jcd_seen(jcd_seen)
                 save_seen_ids(seen_ids)
                 if mode == "daily":
                     save_last_run_date()
+                if on_jcd_search_complete is not None:
+                    await on_jcd_search_complete(jcd_seen)
                 if on_search_complete is not None:
                     await on_search_complete(seen_ids)
             except Exception:

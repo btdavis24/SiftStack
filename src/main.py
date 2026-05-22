@@ -336,6 +336,14 @@ async def actor_main() -> None:
             kcoj_seen_cases = await kvs.get_value("kcoj_seen_cases") or {}
             Actor.log.info("Loaded %d previously-seen KCOJ case numbers from KVS", len(kcoj_seen_cases))
 
+            # ── Load JCD lis-pendens seen-instrument cache from KVS ────────────
+            # Mirrors kcoj_seen_cases exactly. JCD lis pendens recur in the
+            # rolling daily window; without this, the daily scheduled Apify run
+            # would resend every still-open instrument to DataSift every morning
+            # (and re-pay the PDF/OCR cost). KVS is the cloud source of truth.
+            jcd_seen = await kvs.get_value("jcd_seen_instruments") or {}
+            Actor.log.info("Loaded %d previously-seen JCD instruments from KVS", len(jcd_seen))
+
             # ── Load re-poll queue from KVS (Phase 6 / COVER-01) ──────────────
             # Mirrors kcoj_seen_cases exactly. Fresh 0-row leads (CourtNet 0 parties /
             # obituary not posted) + Phase 5's credits-exhausted records are enqueued
@@ -360,6 +368,12 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Failed to persist kcoj_seen_cases to KVS: %s", e)
 
+            async def persist_jcd_seen(seen: dict) -> None:
+                try:
+                    await kvs.set_value("jcd_seen_instruments", seen)
+                except Exception as e:
+                    Actor.log.warning("Failed to persist jcd_seen_instruments to KVS: %s", e)
+
             async def persist_kcoj_repoll_queue(queue: dict) -> None:
                 try:
                     await kvs.set_value("kcoj_repoll_queue", queue)
@@ -378,6 +392,8 @@ async def actor_main() -> None:
                 on_kcoj_search_complete=persist_kcoj_seen_cases,
                 repoll_queue=kcoj_repoll_queue,
                 on_repoll_complete=persist_kcoj_repoll_queue,
+                jcd_seen=jcd_seen,
+                on_jcd_search_complete=persist_jcd_seen,
             )
             # Handle async probate lookup before pipeline (requires await)
             probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
@@ -686,13 +702,14 @@ async def actor_main() -> None:
                 except Exception as e:
                     Actor.log.warning("Slack notification failed: %s", e)
 
-            # ── Save last_run_date + seen_notice_ids + kcoj_seen_cases to KVS ─────
+            # ── Save last_run_date + seen_notice_ids + kcoj_seen_cases + jcd_seen_instruments to KVS ─────
             await kvs.set_value("last_run_date", datetime.now().strftime("%Y-%m-%d"))
             await kvs.set_value("seen_notice_ids", seen_ids)
             await kvs.set_value("kcoj_seen_cases", kcoj_seen_cases)
+            await kvs.set_value("jcd_seen_instruments", jcd_seen)
             Actor.log.info(
-                "Saved last_run_date + %d seen_notice_ids + %d kcoj_seen_cases to KVS for next run",
-                len(seen_ids), len(kcoj_seen_cases),
+                "Saved last_run_date + %d seen_notice_ids + %d kcoj_seen_cases + %d jcd_seen_instruments to KVS for next run",
+                len(seen_ids), len(kcoj_seen_cases), len(jcd_seen),
             )
 
             if repoll_queued:
