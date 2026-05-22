@@ -424,6 +424,24 @@ async def actor_main() -> None:
                         )
                     except Exception as e:
                         Actor.log.warning("Tracerfy skip trace failed: %s — continuing", e)
+
+                    # ── Death/identity guard + empty-trace fallback (2g-3/2g-4) ──
+                    # Runs STRICTLY BETWEEN batch_skip_trace (above) and Trestle
+                    # score_record_phones (below) on the SAME Phase-4 fit-gated
+                    # list — dead/wrong-person phones are suppressed before they
+                    # can be scored or dialed (T-05-08).
+                    try:
+                        from skip_trace_guard import guard_all, apply_contact_fallbacks
+                        g_stats = guard_all(dp_for_tracerfy)
+                        fb_stats = apply_contact_fallbacks(dp_for_tracerfy)
+                        Actor.log.info(
+                            "Guard: %d phone(s) suppressed, %d DM(s) unconfirmed; "
+                            "fallback: %d via attorney, %d queued for AOC-805",
+                            g_stats["suppressed_phones"], g_stats["unconfirmed"],
+                            fb_stats["attorney"], fb_stats["aoc805_queued"],
+                        )
+                    except Exception as e:
+                        Actor.log.warning("Skip-trace guard/fallback failed: %s — continuing", e)
                 else:
                     Actor.log.info("No DP candidates — Tracerfy skipped (0 deceased/DM records)")
             elif do_tracerfy:
@@ -445,7 +463,10 @@ async def actor_main() -> None:
             if dp_candidates and config.TRESTLE_API_KEY:
                 try:
                     from phone_validator import score_record_phones
-                    phone_tiers = score_record_phones(dp_candidates, config.TRESTLE_API_KEY)
+                    # litigator risk matters for probate cold outreach (2g-5)
+                    phone_tiers = score_record_phones(
+                        dp_candidates, config.TRESTLE_API_KEY, add_litigator=True,
+                    )
                     Actor.log.info("Trestle scored %d unique phones across DP candidates",
                                    len(phone_tiers))
                 except Exception as e:
@@ -2003,6 +2024,25 @@ def _run_scrape_pipeline(args, searches) -> None:
                 tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
                 tracerfy_stats.get("cost", 0.0),
             )
+
+            # ── Death/identity guard + empty-trace fallback (2g-3/2g-4) ──
+            # Runs STRICTLY BETWEEN batch_skip_trace (above) and Trestle
+            # score_record_phones (below) on the SAME Phase-4 fit-gated
+            # list — dead/wrong-person phones are suppressed before they can
+            # be scored or dialed (T-05-08).
+            try:
+                from skip_trace_guard import guard_all, apply_contact_fallbacks
+                g_stats = guard_all(trace_candidates)
+                fb_stats = apply_contact_fallbacks(trace_candidates)
+                logging.info(
+                    "Guard: %d phone(s) suppressed, %d DM(s) unconfirmed; "
+                    "fallback: %d via attorney, %d queued for AOC-805",
+                    g_stats["suppressed_phones"], g_stats["unconfirmed"],
+                    fb_stats["attorney"], fb_stats["aoc805_queued"],
+                )
+            except Exception as e:
+                logging.warning("Skip-trace guard/fallback failed: %s — continuing", e)
+
             # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
             # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
             if cfg.TRESTLE_API_KEY:
@@ -2013,7 +2053,10 @@ def _run_scrape_pipeline(args, searches) -> None:
                 ]
                 if dp_cands:
                     try:
-                        tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
+                        # litigator risk matters for probate cold outreach (2g-5)
+                        tiers_map = score_record_phones(
+                            dp_cands, cfg.TRESTLE_API_KEY, add_litigator=True,
+                        )
                         logging.info("Trestle scored %d unique phones across %d DP records",
                                      len(tiers_map), len(dp_cands))
                     except Exception as e:
