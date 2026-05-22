@@ -170,6 +170,8 @@ async def actor_main() -> None:
             "TNPN_EMAIL": actor_input.get("tn_username", ""),
             "TNPN_PASSWORD": actor_input.get("tn_password", ""),
             "CAPTCHA_API_KEY": actor_input.get("captcha_api_key", ""),
+            "PVA_EMAIL": actor_input.get("pva_email", ""),
+            "PVA_PASSWORD": actor_input.get("pva_password", ""),
             "ANTHROPIC_API_KEY": actor_input.get("anthropic_api_key", ""),
             "SMARTY_AUTH_ID": actor_input.get("smarty_auth_id", ""),
             "SMARTY_AUTH_TOKEN": actor_input.get("smarty_auth_token", ""),
@@ -204,25 +206,36 @@ async def actor_main() -> None:
         include_commercial = actor_input.get("include_commercial", False)
         include_entities = actor_input.get("include_entities", False)
 
-        # Validate
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            Actor.log.error("tn_username and tn_password are required")
-            try:
-                from slack_notifier import notify_preflight_failure
-                notify_preflight_failure(["TNPN credentials missing"])
-            except Exception:
-                pass
-            await Actor.fail(status_message="Missing SiftStack credentials")
-            return
-        if not config.CAPTCHA_API_KEY:
-            Actor.log.warning("captcha_api_key not set — CAPTCHA solving will fail")
-
-        # Filter searches
+        # ── Resolve which data sources this run will actually touch ──────
         searches = _filter_searches(counties, types)
         if not searches:
             Actor.log.error("No saved searches match the given counties/types filters")
             await Actor.fail(status_message="No matching saved searches")
             return
+
+        has_tnpn = any(getattr(s, "source", "tnpn") == "tnpn" for s in searches)
+        has_ky = any(getattr(s, "source", "tnpn") in ("jcd", "kcoj") for s in searches)
+
+        # Validate — require only the creds the active sources actually use.
+        # TN Public Notice searches need the TNPN login + 2Captcha; KY sources
+        # (JCD lis pendens, KCOJ probate) need neither to scrape, but their
+        # enrichment needs the Jefferson PVA login.
+        if has_tnpn and (not config.TNPN_EMAIL or not config.TNPN_PASSWORD):
+            Actor.log.error("tn_username and tn_password are required for TN (tnpublicnotice.com) searches")
+            try:
+                from slack_notifier import notify_preflight_failure
+                notify_preflight_failure(["TNPN credentials missing"])
+            except Exception:
+                pass
+            await Actor.fail(status_message="Missing TN credentials")
+            return
+        if has_tnpn and not config.CAPTCHA_API_KEY:
+            Actor.log.warning("captcha_api_key not set — CAPTCHA solving will fail")
+        if has_ky and (not config.PVA_EMAIL or not config.PVA_PASSWORD):
+            Actor.log.warning(
+                "pva_email/pva_password not set — KY probate/lis_pendens enrichment "
+                "(property values, deeds, equity) will run unauthenticated"
+            )
 
         Actor.log.info(
             "Running %d saved searches: %s",
