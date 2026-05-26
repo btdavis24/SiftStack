@@ -274,6 +274,77 @@ def test_net_encumbrances_pure():
     print("PASS: test_net_encumbrances_pure")
 
 
+# ── LP/judgment lien dedup by instnum — regression for 25-P-001859 bug ────
+def test_lien_dedup_by_instnum():
+    """Same instrument indexed under multiple party-name variations must only
+    haircut once. Real case: 25-P-001859 had instrument 2026019820 returned 5x
+    by dlist.php (cross-indexed under each grantor/grantee variant) producing
+    $-23M equity on a $168K property. Dedup by instnum prevents the over-count.
+    """
+    n = _notice(168500, decedent_name="JAGGERS LINDA")
+    # Same instnum 2026019820 appears 5x (the real bug); a SECOND instrument
+    # 2025049323 appears 3x; both should each haircut exactly ONCE.
+    lp_dup = [
+        _rec("LIS PENDENS", instnum="2026019820", grantor="JAGGERS LINDA",
+             grantee="WELLS FARGO", amount="2875470"),
+        _rec("LIS PENDENS", instnum="2026019820", grantor="JAGGERS LINDA C",
+             grantee="WELLS FARGO", amount="2875470"),
+        _rec("LIS PENDENS", instnum="2026019820", grantor="JAGGERS L",
+             grantee="WELLS FARGO", amount="2875470"),
+        _rec("LIS PENDENS", instnum="2026019820", grantor="LINDA JAGGERS",
+             grantee="WELLS FARGO", amount="2875470"),
+        _rec("LIS PENDENS", instnum="2026019820", grantor="JAGGERS LINDA KAY",
+             grantee="WELLS FARGO", amount="2875470"),
+        _rec("LIS PENDENS", instnum="2025049323", grantor="JAGGERS LINDA",
+             grantee="BANK A", amount="2766614"),
+        _rec("LIS PENDENS", instnum="2025049323", grantor="JAGGERS LINDA C",
+             grantee="BANK A", amount="2766614"),
+        _rec("LIS PENDENS", instnum="2025049323", grantor="JAGGERS L",
+             grantee="BANK A", amount="2766614"),
+    ]
+    haircut, flags = _net_encumbrances(n, lp_dup, 168500.0)
+    expected = 2875470 + 2766614  # each instrument counted ONCE
+    assert haircut == expected, (
+        f"Expected {expected:,} (one haircut per unique instnum), got {haircut:,} "
+        f"(over-count by {haircut - expected:,})"
+    )
+    assert "lis_pendens" in flags, flags
+    print("PASS: test_lien_dedup_by_instnum")
+
+
+def test_lien_dedup_preserves_distinct_instnums():
+    """Two genuinely different instruments must BOTH count — dedup is by
+    instnum, not by bucket. Guards against an over-aggressive dedup that
+    would collapse separate LP filings against the same property."""
+    n = _notice(300000)
+    recs = [
+        _rec("JUDGMENT", instnum="2022000001", grantor="OWNER",
+             grantee="CREDITOR A", amount="10000"),
+        _rec("JUDGMENT", instnum="2023000002", grantor="OWNER",
+             grantee="CREDITOR B", amount="15000"),
+        _rec("LIS PENDENS", instnum="2024000003", grantor="OWNER",
+             grantee="BANK", amount="20000"),
+    ]
+    haircut, flags = _net_encumbrances(n, recs, 300000.0)
+    assert haircut == 45000, haircut  # 10k + 15k + 20k, all distinct instnums
+    assert "judgment" in flags and "lis_pendens" in flags, flags
+    print("PASS: test_lien_dedup_preserves_distinct_instnums")
+
+
+def test_lien_dedup_empty_instnum_not_collapsed():
+    """Records with empty instnum (data-quality oddity) should NOT collapse to
+    one — empty key would otherwise dedupe legitimately-separate items into a
+    single hit. Each empty-instnum row stands alone."""
+    n = _notice(200000)
+    recs = [
+        _rec("JUDGMENT", instnum="", grantor="O", grantee="A", amount="5000"),
+        _rec("JUDGMENT", instnum="", grantor="O", grantee="B", amount="7000"),
+    ]
+    haircut, _flags = _net_encumbrances(n, recs, 200000.0)
+    assert haircut == 12000, haircut  # both counted
+    print("PASS: test_lien_dedup_empty_instnum_not_collapsed")
+
+
 if __name__ == "__main__":
     test_wheatley_hecm()
     test_herflicker_hecm()
@@ -291,4 +362,7 @@ if __name__ == "__main__":
     test_has_medicaid_signal_unit()
     test_malformed_record_no_crash()
     test_net_encumbrances_pure()
+    test_lien_dedup_by_instnum()
+    test_lien_dedup_preserves_distinct_instnums()
+    test_lien_dedup_empty_instnum_not_collapsed()
     print("\nALL TESTS PASSED")

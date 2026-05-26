@@ -34,6 +34,41 @@ logger = logging.getLogger(__name__)
 # ── Shared helpers ────────────────────────────────────────────────────
 
 
+def is_tracerfy_eligible(notice, min_fit: int) -> bool:
+    """Decide whether a NoticeData record should be sent to Tracerfy.
+
+    Two-gate predicate matching the inline list comprehension in actor_main:
+      1. Fit gate: wholesale_fit_score >= min_fit (fails closed on blank/0).
+      2. Secondary gate: at least one of
+         - deceased owner (probate happy path),
+         - heir_map_json (signing heirs to trace),
+         - decision_maker_name (named PR/executor),
+         - lis_pendens record with owner_name + address (living-owner trace).
+
+    Extracted from the inline gate so the predicate is independently testable
+    without mocking the full actor_main flow.
+    """
+    try:
+        score = int(notice.wholesale_fit_score or 0)
+    except (TypeError, ValueError):
+        return False
+    if score < min_fit:
+        return False
+    if notice.owner_deceased == "yes":
+        return True
+    if notice.heir_map_json:
+        return True
+    if notice.decision_maker_name:
+        return True
+    if (
+        notice.notice_type == "lis_pendens"
+        and notice.owner_name
+        and notice.address
+    ):
+        return True
+    return False
+
+
 def _filter_searches(
     counties: list[str] | None,
     types: list[str] | None,
@@ -480,15 +515,15 @@ async def actor_main() -> None:
                     return True
 
             if do_tracerfy and config.TRACERFY_API_KEY:
-                # Fit gate (Phase 4): paid Tracerfy runs only on records at/above
-                # SKIP_TRACE_MIN_FIT, keeping the deceased/DM condition as a
-                # SECONDARY requirement. Parse wholesale_fit_score defensively so an
-                # unscored/blank record fails CLOSED (scores 0 → excluded), never
-                # crashing the gate.
+                # Two-gate eligibility (see is_tracerfy_eligible docstring):
+                #   1. Fit gate (Phase 4): wholesale_fit_score >= SKIP_TRACE_MIN_FIT.
+                #   2. Secondary: deceased/heir/DM (DP path) OR lis_pendens with
+                #      owner_name + address (living-owner trace).
+                # Score is parsed defensively so an unscored/blank record fails
+                # CLOSED (treated as 0 → excluded).
                 dp_for_tracerfy = [
                     n for n in notices
-                    if (int(n.wholesale_fit_score or 0) >= config.SKIP_TRACE_MIN_FIT)
-                    and (n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name)
+                    if is_tracerfy_eligible(n, config.SKIP_TRACE_MIN_FIT)
                 ]
                 # Defensive no-op on top of Phase 4's gate (no double-apply).
                 dp_for_tracerfy = [n for n in dp_for_tracerfy if _passes_fit_gate(n)]

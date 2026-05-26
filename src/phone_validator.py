@@ -308,7 +308,11 @@ def process_phones(
 
                 if "error" in data and not data.get("is_valid"):
                     if data.get("error") == "Invalid API key":
-                        logger.error("Invalid Trestle API key — aborting")
+                        logger.error(
+                            "Trestle authentication failed (HTTP 403) — "
+                            "TRESTLE_API_KEY may be expired, wrong, or unset "
+                            "(check Apify Console → Schedule → Inputs)."
+                        )
                         raise ValueError("Invalid Trestle API key")
                     errors.append(data)
                     continue
@@ -435,7 +439,13 @@ def score_record_phones(
                     continue
                 if "error" in data and not data.get("is_valid"):
                     if data.get("error") == "Invalid API key":
-                        logger.error("Invalid Trestle API key — aborting heir scoring")
+                        logger.error(
+                            "Trestle authentication failed (HTTP 403) — "
+                            "TRESTLE_API_KEY may be expired, wrong, or not set in "
+                            "Apify Console → Schedule → Inputs. Aborting phone "
+                            "scoring; pipeline continues. Phones from Tracerfy "
+                            "remain on records, just unscored."
+                        )
                         return results
                     continue
                 score = data.get("activity_score")
