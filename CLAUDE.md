@@ -403,6 +403,20 @@ python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount" -
 # Output: JSON file in output/market_finder_{state}_{county}_{timestamp}.json
 ```
 
+## Brand PDF Standard (LOCKED)
+
+**Every PDF deliverable the business produces uses the visual standard set by the *5510 Bruns Dr* and *6307 Highway 329* lender review flyers** — black header band, cream background, red brand accent, red 2pt rule under the header, big serif title, red-bar section labels, branded footer with company line + `PAGE NN / TT`. This applies to lender flyers, disposition flyers, internal SOPs, checklists, market reports, buyer packets — anything we hand to a person.
+
+**Implementation:**
+- [src/brand_pdf.py](src/brand_pdf.py) — reusable primitives (palette, type system, `page_painter`, `status_bar`, `section_label`, `hrule`, `make_doc`). Import this in every new deliverable.
+- [src/checklist_pdf.py](src/checklist_pdf.py) — minimal reference deliverable.
+- [docs/brand/pdf_styling.md](docs/brand/pdf_styling.md) — full visual spec, palette table, typography table, tagline conventions per deliverable type, code template.
+
+**Rules:**
+- Do **not** introduce new colors, fonts, or layout chrome in deliverable files. Add to `brand_pdf` so the brand stays consistent.
+- Do **not** ship a deliverable in any other style without explicit approval — consistency across deliverables is the brand.
+- `src/disposition_flyer.py` predates this standard and uses its own palette/layout. It will be migrated to `brand_pdf` in a future pass. New deliverables must use `brand_pdf` from day one.
+
 ## Disposition Flyer (build 1.0.30+)
 
 1-page buyer-facing PDF for wholesale dispositions. Pulls property data from Jefferson PVA, downloads first iPhone photo from Google Drive, builds a branded flyer with hero photo + stats + asking/ARV + additional info + photos link, uploads PDF back to the property folder. Source: `src/disposition_flyer.py`.

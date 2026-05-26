@@ -275,6 +275,11 @@ def _net_encumbrances(
     # whose doc_type didn't classify as a "mortgage" (e.g. doc_type=="HECM")
     # is caught here as a flag-only encumbrance — still NOT straight-lined.
     active_instnum = active_mtg.instnum if active_mtg is not None else None
+    # Jefferson dlist.php re-indexes the same lien document under each grantor/
+    # grantee name variation, so a single LP/judgment filing can appear multiple
+    # times in `records`. Dedup by instnum so one filing only haircuts once
+    # (real case 25-P-001859: instrument 2026019820 was counted 5× → $-23M equity).
+    seen_lien_instnum: set[str] = set()
     for rec in records:
         if active_instnum and rec.instnum == active_instnum:
             continue  # already handled on the mortgage path
@@ -302,6 +307,11 @@ def _net_encumbrances(
             continue
         if bucket not in ("judgment", "lis_pendens", "tax_cert"):
             continue
+        # Same instrument already counted? Skip — see seen_lien_instnum comment.
+        if rec.instnum and rec.instnum in seen_lien_instnum:
+            continue
+        if rec.instnum:
+            seen_lien_instnum.add(rec.instnum)
         flags.add(bucket)
         amount = _record_amount(rec, amounts)
         if amount > 0:
