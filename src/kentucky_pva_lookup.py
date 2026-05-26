@@ -688,6 +688,57 @@ def _entity_search_variations(holder: str) -> list[str]:
     return list(dict.fromkeys(v for v in variations if v.strip()))
 
 
+def _holder_match_score(holder: str, row_owner: str) -> float:
+    """Token-overlap score for corroborating a PVA candidate vs a deed-chain holder.
+
+    Returns the fraction of ``holder``'s alphanumeric tokens that appear in
+    ``row_owner``. 1.0 = every holder token is present; 0.0 = no overlap.
+    Punctuation (including commas) and case are normalized away; one-character
+    tokens (initials) count. Used by the disambiguation guard (Fix A) to pick
+    the correct parcel when PVA returns multiple same-name results — the
+    deed chain already identified the current holder, so we use that as the
+    authoritative tie-breaker.
+    """
+    def _tokens(s: str) -> set[str]:
+        return {t for t in re.sub(r"[^A-Z0-9]+", " ", (s or "").upper()).split() if t}
+    h = _tokens(holder)
+    if not h:
+        return 0.0
+    o = _tokens(row_owner)
+    if not o:
+        return 0.0
+    return len(h & o) / len(h)
+
+
+def _surname_for_pva_fallback(target: str) -> str:
+    """Best-guess surname for a last-resort surname-only PVA search (Fix B).
+
+    Returns empty for entity targets (LLC/trust/etc) — surname-only on those
+    is meaningless. For "LAST, FIRST" returns the part before the comma. For
+    all-caps "LAST FIRST" (court/deed convention) returns the first token. For
+    mixed-case "First Last" natural order returns the last token.
+    """
+    if not target or _ENTITY_NAME_RE.search(target):
+        return ""
+    if "," in target:
+        return target.split(",", 1)[0].strip().upper()
+    tokens = [t for t in re.split(r"\s+", target.strip()) if t]
+    if not tokens:
+        return ""
+    letters_only = re.sub(r"[^A-Za-z]", "", target)
+    if letters_only and letters_only.isupper():
+        return tokens[0].upper()  # all-caps "LAST FIRST" convention
+    return tokens[-1].upper()      # mixed-case "First Last"
+
+
+# Holder-corroborated disambiguation thresholds. Top candidate must clear the
+# score floor (most holder tokens present) AND beat the runner-up by the margin
+# — preventing ambiguous picks while letting through clear winners that the
+# existing address-only disambiguator would decline for lack of corroboration.
+_HOLDER_DISAMBIG_MIN_SCORE = 0.66
+_HOLDER_DISAMBIG_MARGIN = 0.20
+
+
 def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
     """Search PVA for the property tied to this notice.
 
@@ -735,6 +786,20 @@ def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
             maiden_name=getattr(notice, "decedent_obit_maiden_name", None) or None,
             prior_surnames=getattr(notice, "decedent_also_known_as", None) or None,
         )
+
+        # Fix B — append a surname-only variant at lowest confidence as a
+        # last-resort fallback. Catches cases where PVA's indexed format
+        # diverges from the LAST FIRST / LAST FIRST MIDDLE variations (married-
+        # name records, middle-initial-required indices, etc.). The broad
+        # result set is then pinned to the correct parcel by Fix A's
+        # holder-corroborated disambiguation above.
+        surname_only = _surname_for_pva_fallback(primary_target)
+        if surname_only and not any(v.value == surname_only for v in variants):
+            variants.append(NameVariant(
+                value=surname_only, fmt="SURNAME_ONLY",
+                source="primary", confidence=0.10,
+            ))
+
     if not variants:
         return
 
@@ -770,6 +835,38 @@ def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
             if score_match(query, row.owner) >= _MIN_MATCH_SCORE
         ]
         if len(scoring_rows) >= 2:
+            # Fix A — deed-chain-corroborated disambiguation. When the deed
+            # chain (Step 3c) already identified the current property holder,
+            # use it as the authoritative tie-breaker: pick the parcel whose
+            # owner string best matches that holder. Far more reliable than the
+            # address-only disambiguate below for probate (which has no address
+            # corroboration available before Step 3d completes).
+            chain_holder = (notice.current_property_holder or "").strip()
+            if chain_holder:
+                holder_scored = sorted(
+                    ((_holder_match_score(chain_holder, r.owner), r) for r in scoring_rows),
+                    key=lambda x: x[0], reverse=True,
+                )
+                top_score, top_row = holder_scored[0]
+                runner_up_score = holder_scored[1][0] if len(holder_scored) > 1 else 0.0
+                if (top_score >= _HOLDER_DISAMBIG_MIN_SCORE
+                        and (top_score - runner_up_score) >= _HOLDER_DISAMBIG_MARGIN):
+                    logger.info(
+                        "  [PVA]   deed-chain disambiguate picked %r "
+                        "(holder=%r score=%.2f margin=%.2f) from %d parcels for %r",
+                        top_row.owner, chain_holder, top_score,
+                        top_score - runner_up_score, len(scoring_rows), query,
+                    )
+                    # Use the variant's score_match against the picked row, so
+                    # the early-break threshold (>=0.85) compares apples-to-apples.
+                    picked_score = score_match(query, top_row.owner)
+                    best = (max(picked_score, top_score), top_row, query)
+                    if best[0] >= 0.85:
+                        break
+                    continue
+                # Otherwise fall through to the existing disambiguator below —
+                # holder-corroboration was not decisive (tied or no clear winner).
+
             candidates = [
                 CandidatePerson(
                     name=row.owner,
