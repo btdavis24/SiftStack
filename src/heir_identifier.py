@@ -252,20 +252,97 @@ def _fetch_deed_records(notice: NoticeData) -> list:
     return _parse_deed_list(html)
 
 
+_NAME_SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV"})
+
+
+def _split_concatenated_jcd_parties(s: str) -> list[str]:
+    """Split a JCD-style concatenated party string into individual parties.
+
+    JCD's ``dlist.php`` renders multi-party grantor/grantee cells with
+    HTML structural separators (``<br>``, ``<div>``) that BeautifulSoup's
+    ``get_text(" ")`` collapses to plain spaces. The result is one string
+    like ``"HUPP CATHY HUPP PAUL E JR"`` (two parties: ``HUPP CATHY`` and
+    ``HUPP PAUL E JR``). Each party is in LAST FIRST [MIDDLE] [SUFFIX]
+    format per JCD convention.
+
+    Detection algorithm (suffix-anchored):
+      1. ``tokens[0]`` is a surname (JCD convention).
+      2. Any token immediately following a suffix (``JR``/``SR``/``II``/
+         ``III``/``IV``) is a NEW surname.
+      3. Walk tokens; close current party + start new when we see a
+         surname-marker token (after current has >= 1 token), OR after
+         a suffix terminator.
+
+    Limitations: cannot detect a new surname that appears only once and
+    isn't preceded by a suffix. E.g. ``"SMITH JOHN JONES JANE"`` (two
+    parties, no suffix or repeat) is returned as a single string. This
+    is best-effort — better than treating concatenated strings as one
+    party, not exhaustive.
+    """
+    tokens = s.upper().split()
+    if not tokens:
+        return []
+
+    # Suffix-anchored surname detection: each token following a suffix
+    # is confirmed-new-surname for the next party. First token is the
+    # initial surname.
+    surname_markers: set[str] = {tokens[0]}
+    for i, tok in enumerate(tokens):
+        if tok in _NAME_SUFFIXES and i + 1 < len(tokens):
+            surname_markers.add(tokens[i + 1])
+
+    parties: list[list[str]] = []
+    current: list[str] = []
+    for tok in tokens:
+        if not current:
+            current.append(tok)
+            continue
+        if tok in _NAME_SUFFIXES:
+            current.append(tok)
+            parties.append(current)
+            current = []
+            continue
+        if tok in surname_markers:
+            parties.append(current)
+            current = [tok]
+            continue
+        current.append(tok)
+    if current:
+        parties.append(current)
+
+    return [" ".join(p) for p in parties]
+
+
 def _split_deed_parties(party_string: str) -> list[str]:
     """Split a deed grantor/grantee cell into individual party names.
 
-    Deed parties are rendered like "WALKER EARL & WALKER BERTHA" or
-    "MCGARVEY KEVIN; MCGARVEY SHEILA". Split on the common separators, drop
-    obvious business entities, and de-dup preserving order. Bounded output.
+    Three formats seen in JCD data:
+      * Explicit separators (clean): "WALKER EARL & WALKER BERTHA",
+                                     "MCGARVEY KEVIN; MCGARVEY SHEILA"
+      * No separator (concatenated): "HUPP CATHY HUPP PAUL E JR"
+                                     "STITH PEGGY ROSE STITH RAYMOND OHARA JAMES"
+
+    Pipeline: first split on explicit separators, then run each result
+    through the JCD concatenation splitter when it has >= 4 tokens (the
+    longest single name LAST FIRST MIDDLE SUFFIX is 4 tokens — anything
+    longer is probably 2+ people). Drop business entities and de-dup
+    preserving order. Bounded output.
     """
     if not party_string:
         return []
     parts = re.split(r"\s*(?:&|;|\band\b|,(?!\s*(?:JR|SR|II|III|IV)\b))\s*",
                      party_string, flags=re.IGNORECASE)
+    # Each piece may STILL be a concatenated multi-party string.
+    expanded: list[str] = []
+    for part in parts:
+        token_count = len(part.strip().split())
+        if token_count >= 4:
+            expanded.extend(_split_concatenated_jcd_parties(part))
+        else:
+            expanded.append(part)
     out: list[str] = []
     seen: set[str] = set()
-    for p in parts:
+    for p in expanded:
         name = re.sub(r"\s+", " ", p).strip()
         if not name or len(name) < 3:
             continue
