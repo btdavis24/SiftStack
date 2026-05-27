@@ -765,6 +765,44 @@ def _surname_for_pva_fallback(target: str) -> str:
 _HOLDER_DISAMBIG_MIN_SCORE = 0.66
 _HOLDER_DISAMBIG_MARGIN = 0.20
 
+# Heir-recent uncertain-match thresholds. When an heir takes title via a
+# recent deed transfer (Phase 2b detects 'heir_recent'), PVA may not yet
+# show the LP property under the heir's name — the disambiguator then
+# falls back to picking a DIFFERENT parcel the heir owns (their own
+# residence, a rental, etc.). The match's `row.address` is for that other
+# parcel, and `_apply_to_notice` reads the mailing-address field as the
+# notice address — sometimes coincidentally pointing back to the LP
+# property (the HUPP/GOLDSMITH 2026-05-27 case), but usually not.
+# Downstream Smarty + Zillow re-fetch by address and correct the value /
+# sqft / sale data — but `parcel_id` has no downstream override and
+# remains the wrong PIDN. The guard below detects this scenario and
+# suppresses parcel_id writes so we don't propagate the wrong reference.
+_HEIR_RECENT_UNCERTAIN_MIN_CANDIDATES = 5
+_HEIR_RECENT_UNCERTAIN_MAX_SCORE = 0.90
+
+
+def _is_uncertain_heir_recent_match(
+    relationship: str, num_candidates: int, holder_score: float,
+) -> bool:
+    """Decide whether an heir_recent PVA pick should suppress parcel_id.
+
+    Returns True only when ALL three signals fire:
+      * relationship == 'heir_recent' (a recent transfer to a new owner)
+      * num_candidates >= 5 (common surname, harder disambiguation)
+      * holder_score < 0.90 (less than near-exact owner-string match)
+
+    Used by `_lookup_one` to clear `notice.parcel_id` after a low-confidence
+    heir_recent pick — the address survives (Zillow downstream re-derives
+    everything else from it), but the parcel reference is dropped instead
+    of pointing to the heir's OTHER property. See module-level guard
+    constants for the thresholds + the HUPP/GOLDSMITH case context.
+    """
+    if relationship != "heir_recent":
+        return False
+    if num_candidates < _HEIR_RECENT_UNCERTAIN_MIN_CANDIDATES:
+        return False
+    return holder_score < _HEIR_RECENT_UNCERTAIN_MAX_SCORE
+
 
 def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
     """Search PVA for the property tied to this notice.
@@ -837,6 +875,12 @@ def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
     )
 
     best: tuple[float, PvaRow, str] | None = None  # (score, row, variation_used)
+    # Set to True if the holder-disambig pick was for an heir_recent target with
+    # many candidates and a sub-0.90 holder score — see
+    # _is_uncertain_heir_recent_match. We use this AFTER _apply_to_notice to clear
+    # parcel_id, which is the one field with no downstream override (Zillow
+    # corrects address/value/sale-data; parcel_id from the wrong parcel persists).
+    uncertain_heir_recent = False
 
     # Loop variants HIGHEST-confidence-first (generate_variants returns them
     # ordered). Break early on a strong hit — same accept thresholds as before.
@@ -884,6 +928,22 @@ def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
                         top_row.owner, chain_holder, top_score,
                         top_score - runner_up_score, len(scoring_rows), query,
                     )
+                    # heir_recent + many candidates + low score: PVA likely
+                    # still has the LP property under the OLD owner's name,
+                    # so this pick is one of the heir's OTHER parcels. Note
+                    # it so we can drop parcel_id after _apply_to_notice.
+                    if _is_uncertain_heir_recent_match(
+                        holder_relationship, len(scoring_rows), top_score,
+                    ):
+                        uncertain_heir_recent = True
+                        logger.warning(
+                            "  [PVA]   heir_recent match with %d candidates "
+                            "and holder_score=%.2f — picked parcel may be the "
+                            "heir's OTHER property, not the LP target. "
+                            "Will drop parcel_id to avoid propagating the "
+                            "wrong reference (address/Zillow data still applied).",
+                            len(scoring_rows), top_score,
+                        )
                     # Use the variant's score_match against the picked row, so
                     # the early-break threshold (>=0.85) compares apples-to-apples.
                     picked_score = score_match(query, top_row.owner)
@@ -1041,6 +1101,12 @@ def _lookup_one(session: requests.Session, notice: "NoticeData") -> None:
     else:
         initial_status = "direct"
     _apply_to_notice(notice, row, detail, owner_status=initial_status)
+    if uncertain_heir_recent:
+        # The pick was an heir_recent low-confidence match; address may be
+        # right via mailing-address coincidence (or Zillow re-derives by
+        # address), but parcel_id is for the heir's OTHER parcel and has
+        # no downstream override. Drop it rather than ship a wrong PIDN.
+        notice.parcel_id = ""
 
 
 def heir_property_lookup(notices: list["NoticeData"]) -> None:
