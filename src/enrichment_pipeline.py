@@ -459,17 +459,11 @@ def run_enrichment_pipeline(
             len(courtnet_candidates),
         )
         try:
-            import asyncio
-            from kcoj_case_detail import enrich_case_parties
-            try:
-                asyncio.get_running_loop()
-                # Already in an event loop (pipeline called from async context)
-                logger.warning(
-                    "  [CourtNet] pipeline already in an event loop — "
-                    "scheduling is caller's responsibility; skipping"
-                )
-            except RuntimeError:
-                asyncio.run(enrich_case_parties(courtnet_candidates))
+            # enrich_case_parties_sync handles both the CLI no-loop case and
+            # the Apify already-in-a-loop case (the latter via a worker thread).
+            # Before this wrapper, the Apify path silently skipped.
+            from kcoj_case_detail import enrich_case_parties_sync
+            enrich_case_parties_sync(courtnet_candidates)
             filled_exec = sum(1 for n in courtnet_candidates if n.owner_name.strip())
             filled_atty = sum(1 for n in courtnet_candidates if n.estate_attorney_name.strip())
             logger.info(

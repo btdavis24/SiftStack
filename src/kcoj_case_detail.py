@@ -582,6 +582,65 @@ def apply_parties_to_notice(notice: NoticeData, parties: list[dict]) -> None:
 # ── Public entry point ────────────────────────────────────────────────
 
 
+def enrich_case_parties_sync(
+    notices: list[NoticeData],
+    repoll_queue: dict | None = None,
+) -> None:
+    """Synchronous wrapper around ``enrich_case_parties`` that works both
+    when the caller is inside a running event loop and when it isn't.
+
+    Why: ``enrich_case_parties`` is async (Playwright). The pipeline that
+    calls it is synchronous. Under CLI ``python src/main.py daily`` there is
+    no running event loop, so ``asyncio.run()`` works directly. Under the
+    Apify Actor, ``Actor.main`` is itself an ``async def`` — the outer loop
+    is live, so ``asyncio.run()`` would raise ``RuntimeError: This event
+    loop is already running``. Before this wrapper existed the Apify path
+    silently skipped CourtNet, leaving every probate record with no DM /
+    attorney / party graph.
+
+    Dispatch:
+      - No running loop → ``asyncio.run()`` in the current thread.
+      - Loop already running → ``threading.Thread`` with its own fresh loop.
+        Safe because ``async_playwright()`` spawns its own Node.js subprocess
+        and is not pinned to the caller's event loop. Exceptions from the
+        worker thread are re-raised here so the pipeline's existing try/except
+        still sees them.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop — fast path (CLI).
+        asyncio.run(enrich_case_parties(notices, repoll_queue))
+        return
+
+    # Already inside an event loop (Apify Actor) — punt to a worker thread.
+    import threading
+
+    result_box: dict[str, BaseException | None] = {"exception": None}
+
+    def _worker() -> None:
+        new_loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(new_loop)
+            new_loop.run_until_complete(
+                enrich_case_parties(notices, repoll_queue)
+            )
+        except BaseException as e:  # noqa: BLE001 — propagate any failure
+            result_box["exception"] = e
+        finally:
+            try:
+                new_loop.close()
+            except Exception:  # noqa: BLE001 — best-effort cleanup
+                pass
+
+    thread = threading.Thread(target=_worker, name="courtnet-enrich", daemon=False)
+    thread.start()
+    thread.join()
+
+    if result_box["exception"] is not None:
+        raise result_box["exception"]
+
+
 async def enrich_case_parties(
     notices: list[NoticeData],
     repoll_queue: dict | None = None,
