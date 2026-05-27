@@ -1515,9 +1515,11 @@ def _find_current_holder(
     # Filter to actual deeds (skip mortgages, liens, releases) where the
     # decedent's surname appears in either grantor or grantee.
     candidates: list[DeedRecord] = []
+    deed_count = 0
     for rec in records:
         if _classify(rec.doc_type) != "deed":
             continue
+        deed_count += 1
         if not rec.filed_date:
             continue
         grantor_u = rec.grantor.upper()
@@ -1526,6 +1528,14 @@ def _find_current_holder(
             candidates.append(rec)
 
     if not candidates:
+        # Diagnostic: distinguish "no deed records at all" from "deeds exist
+        # but surname doesn't match any grantor/grantee". The Apify 2026-05-27
+        # run had 17/34 records hit this path — visibility lets us tune later.
+        logger.info(
+            "JCD: no deed-chain holder for %r — %d total records, %d "
+            "classified as deed (none matching surname %r)",
+            decedent_name, len(records), deed_count, dec_surname,
+        )
         return None
     candidates.sort(key=lambda r: r.filed_date, reverse=True)
     most_recent = candidates[0]
@@ -1548,6 +1558,11 @@ def _find_current_holder(
     cutoff_str = cutoff.strftime("%Y-%m-%d")
     if most_recent.filed_date < cutoff_str:
         # Old sale — decedent has no current property here.
+        logger.info(
+            "JCD: no deed-chain holder for %r — most recent deed %s "
+            "is pre-cutoff sale-out (decedent gave up title before %s)",
+            decedent_name, most_recent.filed_date, cutoff_str,
+        )
         return None
 
     holder = _clean_holder_name(most_recent.grantee)
@@ -1559,6 +1574,40 @@ def _find_current_holder(
     else:
         relationship = "heir_recent"
     return (holder, relationship, most_recent.filed_date)
+
+
+def _find_holder_from_active_mortgage(
+    records: list[DeedRecord],
+    decedent_name: str,
+) -> tuple[str, str, str] | None:
+    """Fallback holder detection for when the deed chain comes up empty.
+
+    Returns (holder_name, "self", mortgage_filed_date) when an active
+    (unreleased) mortgage exists whose grantor contains the decedent's
+    surname; otherwise None.
+
+    Rationale: a lender requires every borrower to be on title before
+    funding, so the grantor of an unreleased mortgage is the current
+    legal owner. This catches records where the original purchase deed
+    is missing from JCD's digitized index (pre-1990 deeds are common
+    holes) but the active mortgage confirms current ownership.
+
+    Returns relationship="self" so the title classifier and PVA lookup
+    treat this the same as a deed-confirmed self-holder — no new enum
+    value needed downstream.
+    """
+    active_mtg = _choose_active_mortgage(records)
+    if not active_mtg or not active_mtg.grantor:
+        return None
+    dec_surname = _surname(decedent_name)
+    if not dec_surname:
+        return None
+    if dec_surname not in active_mtg.grantor.upper():
+        return None
+    holder = _clean_holder_name(active_mtg.grantor)
+    if not holder:
+        return None
+    return (holder, "self", active_mtg.filed_date)
 
 
 def _find_recent_transfer(
@@ -1731,6 +1780,22 @@ def lookup_owner_deed_history(
         # earlier runs (trust-held, estate-titled, joint-with-spouse cases
         # all resolve through here).
         holder = _find_current_holder(records, notice.decedent_name or display)
+        # Active-mortgage fallback: when the deed chain finds no holder but
+        # an unreleased mortgage names the decedent as borrower, the borrower
+        # is on title. Catches pre-1990 deeds missing from JCD's digitized
+        # index (e.g. BAKER FLOYD, COPLEY ROBERT W II patterns in the
+        # 2026-05-27 run where deed lookups matched many records but
+        # _find_current_holder returned None).
+        if not holder:
+            holder = _find_holder_from_active_mortgage(
+                records, notice.decedent_name or display,
+            )
+            if holder:
+                logger.info(
+                    "JCD: deed-chain holder for %r unresolved; "
+                    "active-mortgage borrower used as fallback",
+                    display,
+                )
         if holder:
             holder_name, relationship, holder_date = holder
             notice.current_property_holder = holder_name
