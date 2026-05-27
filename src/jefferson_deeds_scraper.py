@@ -471,10 +471,16 @@ def _fetch_address_from_document(view_img: str) -> tuple[str, str, str, str, str
 # ── Name normalisation ────────────────────────────────────────────────
 
 def _normalize_name(raw: str) -> str:
-    """Convert 'LASTNAME FIRSTNAME [MIDDLE]' to 'Firstname Lastname'.
+    """Convert 'LASTNAME FIRSTNAME [MIDDLE...] [SUFFIX]' to natural order
+    'Firstname [Middle] Lastname [Suffix]'.
 
-    Jefferson County stores individual names LAST FIRST. Takes the first
-    party only (grantor may list multiple parties separated by newlines).
+    Jefferson County deeds store individual names as LAST FIRST [MIDDLE]
+    [SUFFIX]. This converts to natural order while preserving the middle
+    names and any JR/SR/II/III/IV suffix.
+
+    Regression context: an earlier version dropped 3rd+ tokens entirely —
+    'ATKINSON SAMPLE GWENDOLYN' became 'Sample Atkinson' and downstream PVA
+    queries missed her records (PVA stores 'ATKINSON SAMPLE GWENDOLYN').
     """
     name = raw.strip()
     if not name:
@@ -493,8 +499,31 @@ def _normalize_name(raw: str) -> str:
         return parts[0].title()
     if len(parts) == 2:
         return f"{parts[1].title()} {parts[0].title()}"
-    # 3+ parts: treat first token as last name
-    return f"{parts[1].title()} {parts[0].title()}"
+
+    # 3+ tokens: LAST FIRST [MIDDLE...] [SUFFIX]
+    suffixes = {"JR", "SR", "II", "III", "IV"}
+
+    def _format_suffix(s: str) -> str:
+        """JR/SR title-case; Roman numerals stay upper (str.title() would
+        emit 'Iii' for 'III'). Kept as a nested helper since this is the
+        only caller."""
+        up = s.upper()
+        return up if up in {"II", "III", "IV"} else up.title()
+
+    if parts[-1].upper() in suffixes:
+        last = parts[0]
+        suffix_display = _format_suffix(parts[-1])
+        first_and_middles = parts[1:-1]
+        if not first_and_middles:
+            # Edge case: "SMITH JR" — surname + suffix only, no first name
+            return f"{last.title()} {suffix_display}"
+        return (f"{' '.join(p.title() for p in first_and_middles)} "
+                f"{last.title()} {suffix_display}")
+
+    # No suffix — straight LAST FIRST [MIDDLE...]
+    last = parts[0]
+    first_and_middles = parts[1:]
+    return f"{' '.join(p.title() for p in first_and_middles)} {last.title()}"
 
 
 # ── Date helpers ──────────────────────────────────────────────────────
