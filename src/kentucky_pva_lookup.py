@@ -691,23 +691,50 @@ def _entity_search_variations(holder: str) -> list[str]:
 def _holder_match_score(holder: str, row_owner: str) -> float:
     """Token-overlap score for corroborating a PVA candidate vs a deed-chain holder.
 
-    Returns the fraction of ``holder``'s alphanumeric tokens that appear in
-    ``row_owner``. 1.0 = every holder token is present; 0.0 = no overlap.
-    Punctuation (including commas) and case are normalized away; one-character
-    tokens (initials) count. Used by the disambiguation guard (Fix A) to pick
-    the correct parcel when PVA returns multiple same-name results — the
-    deed chain already identified the current holder, so we use that as the
-    authoritative tie-breaker.
+    Returns a value in [0.0, 1.0] where 1.0 = every holder token is matched
+    (exactly or via an initial-to-name match). Punctuation (including commas)
+    and case are normalized away.
+
+    Scoring:
+      1. Exact-token intersection (set-based, dedup-safe).
+      2. Initial-to-name boost: when the row has at least as many tokens as
+         the holder, a single-letter token in the row can match a holder
+         token of length>1 whose first letter matches. One initial may only
+         be consumed once. The row-length gate prevents a row like 'BRUCE A'
+         from spuriously matching 'BRUCE JUDITH ANNE' via the A-for-ANNE
+         shortcut.
+
+    The boost breaks the BLEVINS / BRUCE / FERNKAS pattern surfaced in the
+    2026-05-27 Apify run: holder 'BLEVINS, WILLIAM PATRICK' vs PVA candidates
+    'BLEVINS WILLIAM A' / 'BLEVINS WILLIAM E' / 'BLEVINS WILLIAM P' all
+    tied at 0.67 with the old exact-only scoring. With the boost, only the
+    P candidate scores 1.0 — clear margin, disambiguation passes.
     """
-    def _tokens(s: str) -> set[str]:
-        return {t for t in re.sub(r"[^A-Z0-9]+", " ", (s or "").upper()).split() if t}
-    h = _tokens(holder)
-    if not h:
+    def _tokens(s: str) -> list[str]:
+        return [t for t in re.sub(r"[^A-Z0-9]+", " ", (s or "").upper()).split() if t]
+    h_list = _tokens(holder)
+    if not h_list:
         return 0.0
-    o = _tokens(row_owner)
-    if not o:
+    o_list = _tokens(row_owner)
+    if not o_list:
         return 0.0
-    return len(h & o) / len(h)
+    h_set = set(h_list)
+    o_set = set(o_list)
+    matched = len(h_set & o_set)
+
+    # Initial-to-name boost — only when the row has >= holder tokens, so a
+    # bare 'BRUCE A' can't masquerade as 'BRUCE JUDITH ANNE' via A→ANNE.
+    if len(o_set) >= len(h_set):
+        h_remaining = {t for t in (h_set - o_set) if len(t) > 1}
+        o_remaining_initials = {t for t in (o_set - h_set) if len(t) == 1}
+        consumed_initials: set[str] = set()
+        for h_tok in h_remaining:
+            initial = h_tok[0]
+            if initial in o_remaining_initials and initial not in consumed_initials:
+                matched += 1
+                consumed_initials.add(initial)
+
+    return matched / len(h_set)
 
 
 def _surname_for_pva_fallback(target: str) -> str:
