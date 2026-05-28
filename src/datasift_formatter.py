@@ -168,6 +168,21 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     if _is_entity_name(name):
         return ("", "")
 
+    # "Last, First Middle [Suffix]" → (First, Last). CourtNet party names and
+    # probate decedent names arrive surname-first; the part before the comma is
+    # the surname, the first token after it is the given name.
+    # "Pack, Sherri Renee" → ("Sherri", "Pack").
+    if "," in name:
+        surname, _, given = name.partition(",")
+        surname = re.sub(r"[&@#%.]", " ", surname).strip()
+        given_tokens = re.sub(r"[&@#%.]", " ", given).split()
+        if surname and given_tokens:
+            return (given_tokens[0], surname)
+        # Degenerate comma form (e.g. "Pack," with no given name) — fall through
+        # to natural-order handling on the comma-stripped remainder.
+        name = re.sub(r",", " ", name)
+        name = re.sub(r"\s+", " ", name).strip()
+
     # Split joint owners on " & " or " AND " — keep first person only
     # "John & Jane Smith" → "John Smith"
     # "John David & Jane Marie Smith" → "John David Smith"

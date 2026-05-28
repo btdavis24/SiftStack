@@ -105,12 +105,35 @@ def _get_contacts_for_trace(
     return contacts
 
 
+_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
+
+
 def _split_name(name: str) -> tuple[str, str]:
-    """Split a full name into (first, last). Returns ('', '') if unparseable."""
-    parts = name.strip().split()
+    """Split a full name into (first, last). Returns ('', '') if unparseable.
+
+    Handles two orderings:
+    - "Last, First Middle [Suffix]" (CourtNet / probate party format) — the
+      part before the comma is the surname, the first token after it is the
+      given name. e.g. "Pack, Sherri Renee" -> ("Sherri", "Pack").
+    - "First Middle Last [Suffix]" natural order, skipping a trailing
+      generational suffix so "John Paul Smith Jr" -> ("John", "Smith").
+    """
+    name = (name or "").strip()
+    if not name:
+        return ("", "")
+    if "," in name:
+        surname, _, given = name.partition(",")
+        surname = surname.strip()
+        given_tokens = given.split()
+        if surname and given_tokens:
+            return (given_tokens[0], surname)
+    parts = name.split()
     if len(parts) < 2:
         return ("", "")
-    return (parts[0], parts[-1])
+    last = parts[-1]
+    if last.upper().rstrip(".") in _NAME_SUFFIXES and len(parts) >= 3:
+        last = parts[-2]
+    return (parts[0], last)
 
 
 # Keep backward-compatible single-contact function for callers that expect it
