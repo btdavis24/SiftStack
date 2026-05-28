@@ -1298,135 +1298,6 @@ def _lookup_dm_address_tracerfy(name: str, city: str,
         return None
 
 
-def _batch_tracerfy_lookup(notices: list) -> None:
-    """Batch skip-trace all notices that still need a DM mailing address.
-
-    Submits a single CSV with all DM names to Tracerfy, polls for results,
-    and updates NoticeData fields in-place. Much faster than per-record calls.
-    """
-    import config as cfg
-    import csv as csv_mod
-    import io
-
-    if not cfg.TRACERFY_API_KEY or not notices:
-        return
-
-    # Build batch CSV — Tracerfy requires address data for skip tracing
-    csv_buffer = io.StringIO()
-    writer = csv_mod.writer(csv_buffer)
-    writer.writerow(["first_name", "last_name", "address", "city", "state",
-                      "zip", "mail_address", "mail_city", "mail_state"])
-
-    lookup_map: list[tuple] = []  # [(notice, first_name, last_name), ...]
-    for n in notices:
-        parts = n.decision_maker_name.strip().split()
-        if len(parts) < 2:
-            continue
-        first_name = parts[0]
-        last_name = parts[-1]
-        # Use property address as the known address for skip tracing
-        addr = n.address.strip()
-        city_hint = n.city.strip() or "Knoxville"
-        zip_code = n.zip.strip()
-        writer.writerow([first_name, last_name, addr, city_hint, "TN",
-                         zip_code, "", "", ""])
-        lookup_map.append((n, first_name, last_name))
-
-    if not lookup_map:
-        return
-
-    csv_content = csv_buffer.getvalue()
-    csv_buffer.close()
-
-    try:
-        resp = requests.post(
-            "https://tracerfy.com/v1/api/trace/",
-            headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
-            data={
-                "first_name_column": "first_name",
-                "last_name_column": "last_name",
-                "address_column": "address",
-                "city_column": "city",
-                "state_column": "state",
-                "zip_column": "zip",
-                "mail_address_column": "mail_address",
-                "mail_city_column": "mail_city",
-                "mail_state_column": "mail_state",
-            },
-            files={"csv_file": ("dm_batch.csv", csv_content, "text/csv")},
-            timeout=30,
-        )
-        if resp.status_code != 200:
-            logger.debug("Tracerfy batch %d response: %s",
-                         resp.status_code, resp.text[:500])
-        resp.raise_for_status()
-        queue_data = resp.json()
-        queue_id = queue_data.get("queue_id")
-        if not queue_id:
-            logger.warning("Tracerfy batch returned no queue_id")
-            return
-
-        logger.info("  Tracerfy batch job %s submitted (%d records)", queue_id, len(lookup_map))
-
-        # Poll for results — batch jobs take longer
-        # GET /queue/:id may return a list (records) or dict (status wrapper)
-        for _attempt in range(30):
-            time.sleep(5)
-            result_resp = requests.get(
-                f"https://tracerfy.com/v1/api/queue/{queue_id}",
-                headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
-                timeout=15,
-            )
-            result_resp.raise_for_status()
-            result_data = result_resp.json()
-
-            # Handle both response formats
-            if isinstance(result_data, list):
-                records = result_data
-            elif isinstance(result_data, dict):
-                status = result_data.get("status", "")
-                if status == "failed":
-                    logger.warning("Tracerfy batch job %s failed", queue_id)
-                    return
-                if status != "completed":
-                    continue  # still pending
-                records = result_data.get("records", [])
-            else:
-                continue
-
-            matched = 0
-            for rec in records:
-                if not isinstance(rec, dict):
-                    continue
-                street = (rec.get("mail_address") or "").strip()
-                if not street:
-                    continue
-                # Match back to notice by first+last name
-                rec_first = (rec.get("first_name") or "").strip().lower()
-                rec_last = (rec.get("last_name") or "").strip().lower()
-                for notice, first, last in lookup_map:
-                    if (first.lower() == rec_first
-                            and last.lower() == rec_last
-                            and not notice.decision_maker_street):
-                        notice.decision_maker_street = street
-                        notice.decision_maker_city = (rec.get("mail_city") or "").strip()
-                        notice.decision_maker_state = (rec.get("mail_state") or "TN").strip()
-                        notice.decision_maker_zip = (rec.get("mail_zip") or "").strip()
-                        matched += 1
-                        logger.info(
-                            "    Tracerfy batch: %s -> %s, %s %s",
-                            notice.decision_maker_name, street,
-                            notice.decision_maker_city, notice.decision_maker_state,
-                        )
-                        break
-            logger.info("  Tracerfy batch complete: %d/%d matched", matched, len(lookup_map))
-            return
-
-        logger.warning("Tracerfy batch job %s timed out after 150s", queue_id)
-    except Exception as e:
-        logger.warning("Tracerfy batch lookup failed: %s", e)
-
-
 def _lookup_dm_address_ky(name: str, city: str, api_key: str) -> dict | None:
     """KY (Jefferson) address waterfall for a DM/heir, mirroring the TN tier shape.
 
@@ -2844,7 +2715,7 @@ def enrich_obituary_data(
     no_dm_possible_count = 0
     estate_fallback_count = 0
     dm_addr_sources = {"knox_tax_api": 0, "people_search": 0,
-                       "ddg_people_search": 0, "inline_tracerfy": 0, "batch_tracerfy": 0}
+                       "ddg_people_search": 0, "inline_tracerfy": 0}
 
     for j, (notice, parsed, url, source_type, raw_name, is_tax_name) in enumerate(matches, 1):
         city = _default_city(notice)
@@ -3291,22 +3162,9 @@ def enrich_obituary_data(
                 j, len(matches), heir_verified_count, joint_owner_dm_count,
             )
 
-    # ── Phase C: Batch Tracerfy for remaining DMs without addresses ──
-    import config as cfg
-    if not skip_dm_address and cfg.TRACERFY_API_KEY:
-        dm_needs_addr = [
-            n for n in notices
-            if n.decision_maker_name and not n.decision_maker_street
-        ]
-        if dm_needs_addr:
-            logger.info(
-                "Phase C: Batch Tracerfy skip trace for %d DMs without addresses...",
-                len(dm_needs_addr),
-            )
-            before_count = sum(1 for n in dm_needs_addr if n.decision_maker_street)
-            _batch_tracerfy_lookup(dm_needs_addr)
-            batch_found = sum(1 for n in dm_needs_addr if n.decision_maker_street) - before_count
-            dm_addr_sources["batch_tracerfy"] += batch_found
+    # DM mailing addresses are backfilled by the Tracerfy skip-trace pass
+    # (tracerfy_skip_tracer._match_results), which runs post-fit-gate on the
+    # records we actually mail — so no pre-fit-gate batch address lookup here.
 
     # ── Summary ───────────────────────────────────────────────────────
 

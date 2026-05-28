@@ -240,6 +240,7 @@ def batch_skip_trace(
         "matched": 0,
         "phones_found": 0,
         "emails_found": 0,
+        "addresses_found": 0,
         "cost": 0.0,
         "signing_heirs_traced": 0,
         "heir_addresses_filled": 0,
@@ -383,9 +384,12 @@ def batch_skip_trace(
             # Match results back to notices
             _match_results(records, lookup_map, stats)
             stats["cost"] = stats["submitted"] * 0.02
-            logger.info("  Tracerfy batch complete: %d/%d matched, %d phones, %d emails, $%.2f",
-                        stats["matched"], stats["submitted"],
-                        stats["phones_found"], stats["emails_found"], stats["cost"])
+            logger.info(
+                "  Tracerfy batch complete: %d/%d matched, %d phones, "
+                "%d emails, %d DM addresses, $%.2f",
+                stats["matched"], stats["submitted"],
+                stats["phones_found"], stats["emails_found"],
+                stats["addresses_found"], stats["cost"])
             return stats
 
         logger.warning("Tracerfy batch job %s timed out after 5 min", queue_id)
@@ -411,11 +415,40 @@ def _heir_has_phones(notice: NoticeData, heir_key: str) -> bool:
     return False
 
 
+def _maybe_fill_dm_address(notice: NoticeData, rec: dict, stats: dict) -> None:
+    """Upgrade the DM mailing address from a Tracerfy skip-trace record.
+
+    Only fills when the DM currently has no address, or is using the
+    property-address fallback (decision_maker_street == property address).
+    A verified DM address (Knox Tax, obituary survivor, etc.) is never
+    clobbered. This is the consolidated replacement for the old (broken)
+    Phase C batch address lookup in obituary_enricher.
+    """
+    mail_street = (rec.get("mail_address") or "").strip()
+    if not mail_street:
+        return
+    current = (notice.decision_maker_street or "").strip().lower()
+    prop = (notice.address or "").strip().lower()
+    # Weak == empty, or equal to the property address (the fallback).
+    if current and current != prop:
+        return
+    notice.decision_maker_street = mail_street
+    notice.decision_maker_city = (
+        (rec.get("mail_city") or "").strip() or notice.decision_maker_city)
+    notice.decision_maker_state = (
+        (rec.get("mail_state") or "").strip() or notice.decision_maker_state)
+    notice.decision_maker_zip = (
+        (rec.get("mail_zip") or "").strip() or notice.decision_maker_zip)
+    stats["addresses_found"] = stats.get("addresses_found", 0) + 1
+
+
 def _match_results(records: list, lookup_map: list, stats: dict) -> None:
     """Match Tracerfy batch response records back to NoticeData objects.
 
     DM #1's phones/emails go to flat NoticeData fields (backward compat).
     Other signing heirs' phones/emails go into their heir_map_json entry.
+    DM #1's mailing address is upgraded from the skip-trace record when the
+    current address is empty or just the property-address fallback.
     """
     for rec in records:
         if not isinstance(rec, dict):
@@ -444,14 +477,20 @@ def _match_results(records: list, lookup_map: list, stats: dict) -> None:
                 if value:
                     emails.append(value)
 
-            if not phones and not emails:
-                break
-
             # Is this the primary DM (#1)?
             is_primary = (
                 notice.decision_maker_name
                 and heir_key.lower() == notice.decision_maker_name.strip().lower()
             ) or notice.owner_deceased != "yes"
+
+            # Fill the DM mailing address from the skip-trace result. Runs even
+            # when no phones came back, so we still upgrade a property-address
+            # fallback to the executor's real address.
+            if is_primary:
+                _maybe_fill_dm_address(notice, rec, stats)
+
+            if not phones and not emails:
+                break
 
             if is_primary and not notice.primary_phone:
                 # Populate flat NoticeData phone/email fields (backward compat)
