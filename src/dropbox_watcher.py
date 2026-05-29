@@ -245,6 +245,133 @@ def mark_processed(
     _save_state(config.PHOTO_STATE_FILE, photo_state)
 
 
+def _run_skip_trace_guarded(notices: list) -> None:
+    """Fit-gate → Tracerfy → death/identity guard, in the canonical order.
+
+    Mirrors ``main.actor_main``: only wholesale-fit leads are submitted to paid
+    skip trace (Phase 4 fit gate, fails CLOSED), and the death/identity guard
+    runs STRICTLY between the trace and the DataSift upload so dead/wrong-person
+    phones never reach the dialer (W5-CR-02 / G5-CR-02). No-op when Tracerfy is
+    not configured. Never raises — a trace/guard failure must not abort the run.
+    """
+    if not config.TRACERFY_API_KEY:
+        return
+    try:
+        from tracerfy_skip_tracer import batch_skip_trace
+        from skip_trace_guard import (
+            is_tracerfy_eligible,
+            guard_all,
+            apply_contact_fallbacks,
+            handle_credits_exhausted,
+        )
+    except ImportError as e:
+        logger.warning("Skip-trace modules unavailable (%s) — skipping trace", e)
+        return
+
+    # Phase 4 fit gate — fail CLOSED on blank/0 score (single source of truth).
+    eligible = [n for n in notices if is_tracerfy_eligible(n, config.SKIP_TRACE_MIN_FIT)]
+    logger.info("Tracerfy fit-gate: %d/%d eligible (min_fit=%s)",
+                len(eligible), len(notices), config.SKIP_TRACE_MIN_FIT)
+    if not eligible:
+        return
+    try:
+        stats = batch_skip_trace(eligible)
+        if (stats or {}).get("credits_exhausted"):
+            handle_credits_exhausted(eligible, stats)
+        # Death/identity guard — STRICTLY between trace and upload.
+        g = guard_all(eligible)
+        apply_contact_fallbacks(eligible)
+        logger.info(
+            "Tracerfy: %s/%s matched, %s phones | guard: %s phone(s) suppressed, "
+            "%s DM(s) unconfirmed",
+            (stats or {}).get("matched", 0),
+            (stats or {}).get("submitted", len(eligible)),
+            (stats or {}).get("phones_found", 0),
+            g.get("suppressed_phones", 0), g.get("unconfirmed", 0),
+        )
+    except Exception as e:
+        logger.warning("Tracerfy/guard failed: %s — continuing", e)
+
+
+def _upload_and_notify(notices: list) -> None:
+    """Upload the batch to DataSift (enrich + skip trace) and send the Slack summary.
+
+    Guard suppression has already run on ``notices`` (see ``_process_group``), so
+    the DataSift CSV carries only contact data that cleared the death/identity guard.
+    """
+    upload_result = None
+    if config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD:
+        try:
+            import asyncio as _asyncio
+            from datasift_formatter import write_datasift_split_csvs
+            from datasift_uploader import upload_datasift_split, upload_to_datasift
+
+            csv_infos = write_datasift_split_csvs(notices)
+            if len(csv_infos) > 1:
+                upload_result = _asyncio.run(
+                    upload_datasift_split(csv_infos, enrich=True, skip_trace=True)
+                )
+            else:
+                upload_result = _asyncio.run(
+                    upload_to_datasift(csv_infos[0]["path"], enrich=True, skip_trace=True)
+                )
+            if upload_result.get("success"):
+                logger.info("DataSift upload: %s", upload_result.get("message", "OK"))
+            else:
+                logger.error("DataSift upload failed: %s", upload_result.get("message"))
+        except Exception as e:
+            logger.error("DataSift upload error: %s", e)
+            upload_result = {"success": False, "message": str(e)}
+
+    if config.SLACK_WEBHOOK_URL:
+        try:
+            from slack_notifier import send_slack_notification
+            send_slack_notification(notices, upload_result=upload_result)
+        except Exception as e:
+            logger.warning("Slack notification failed: %s", e)
+
+
+def _process_group(county: str, notice_type: str, group_dir: Path) -> bool:
+    """Process one (county, notice_type) batch of photos end to end.
+
+    OCR → enrich → fit-gated + guarded skip trace → CSV → DataSift → Slack.
+
+    Returns True only if at least one record was produced and the CSV was
+    written. The caller uses this to decide whether the source photos may be
+    deleted from Dropbox — a False return means NOTHING was produced, so the
+    source must be retained, never deleted (W5-CR-01 data loss).
+    """
+    from photo_importer import process_photos
+    from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
+    from data_formatter import write_csv
+    from datetime import datetime
+
+    api_key = config.ANTHROPIC_API_KEY or None
+    notices = process_photos(
+        folder=group_dir, county=county, notice_type=notice_type, api_key=api_key,
+    )
+    if not notices:
+        return False
+
+    opts = PipelineOptions(source_label=f"Dropbox watcher ({county}/{notice_type})")
+    notices = run_enrichment_pipeline(notices, opts)
+    if not notices:
+        return False
+
+    # Phase 4 fit gate + Phase 5 death/identity guard MUST run BEFORE any CSV
+    # write / upload so suppressed dead/wrong-person phones never reach the
+    # dialer (W5-CR-02 / G5-CR-02). Mirrors main.actor_main ordering.
+    _run_skip_trace_guarded(notices)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    filename = f"{county.lower()}_{notice_type}_{timestamp}.csv"
+    write_csv(notices, filename=filename)
+    logger.info("Output: %s (%d records)", filename, len(notices))
+
+    _upload_and_notify(notices)
+    return True
+
+
 def run_watcher(
     poll_interval: int | None = None,
     delete_after: bool = True,
@@ -257,10 +384,6 @@ def run_watcher(
         delete_after: Delete photos from Dropbox after processing.
         max_polls: Maximum number of poll cycles (None = infinite).
     """
-    from photo_importer import process_photos
-    from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
-    from data_formatter import write_csv
-
     interval = poll_interval or config.DROPBOX_POLL_INTERVAL
     root_folder = config.DROPBOX_ROOT_FOLDER
 
@@ -293,80 +416,33 @@ def run_watcher(
                     if "local_path" in item and item["local_path"].exists():
                         shutil.copy2(item["local_path"], group_dir / item["filename"])
 
-                # Process photos
-                api_key = config.ANTHROPIC_API_KEY or None
-                notices = process_photos(
-                    folder=group_dir,
-                    county=county,
-                    notice_type=notice_type,
-                    api_key=api_key,
-                )
-
-                if notices:
-                    # Run enrichment
-                    opts = PipelineOptions(
-                        source_label=f"Dropbox watcher ({county}/{notice_type})",
+                # Process the group in isolation: one bad group must not kill the
+                # long-running daemon (W5-WR-01), and a group that produced NO
+                # records must NOT delete its source photos (W5-CR-01 data loss).
+                produced_records = False
+                try:
+                    produced_records = _process_group(county, notice_type, group_dir)
+                except Exception:
+                    logger.exception(
+                        "Group %s/%s failed — source photos retained for retry",
+                        county, notice_type,
                     )
-                    notices = run_enrichment_pipeline(notices, opts)
-
-                    if notices:
-                        from datetime import datetime
-                        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-                        filename = f"{county.lower()}_{notice_type}_{timestamp}.csv"
-                        write_csv(notices, filename=filename)
-                        logger.info("Output: %s (%d records)", filename, len(notices))
-
-                        # Tracerfy skip trace
-                        if config.TRACERFY_API_KEY:
-                            try:
-                                from tracerfy_skip_tracer import batch_skip_trace
-                                stats = batch_skip_trace(notices)
-                                logger.info(
-                                    "Tracerfy: %d/%d matched, %d phones",
-                                    stats["matched"], stats["submitted"],
-                                    stats["phones_found"],
-                                )
-                            except Exception as e:
-                                logger.warning("Tracerfy failed: %s — continuing", e)
-
-                        # DataSift upload
-                        upload_result = None
-                        if config.DATASIFT_EMAIL and config.DATASIFT_PASSWORD:
-                            try:
-                                import asyncio as _asyncio
-                                from datasift_formatter import write_datasift_split_csvs
-                                from datasift_uploader import upload_datasift_split, upload_to_datasift
-
-                                csv_infos = write_datasift_split_csvs(notices)
-                                if len(csv_infos) > 1:
-                                    upload_result = _asyncio.run(
-                                        upload_datasift_split(csv_infos, enrich=True, skip_trace=True)
-                                    )
-                                else:
-                                    upload_result = _asyncio.run(
-                                        upload_to_datasift(csv_infos[0]["path"], enrich=True, skip_trace=True)
-                                    )
-                                if upload_result.get("success"):
-                                    logger.info("DataSift upload: %s", upload_result.get("message", "OK"))
-                                else:
-                                    logger.error("DataSift upload failed: %s", upload_result.get("message"))
-                            except Exception as e:
-                                logger.error("DataSift upload error: %s", e)
-                                upload_result = {"success": False, "message": str(e)}
-
-                        # Slack notification
-                        if config.SLACK_WEBHOOK_URL:
-                            try:
-                                from slack_notifier import send_slack_notification
-                                send_slack_notification(notices, upload_result=upload_result)
-                            except Exception as e:
-                                logger.warning("Slack notification failed: %s", e)
-
-                # Mark as processed and clean up
-                mark_processed(dbx, group_items, delete_after=delete_after)
-
-                # Clean up temp directory
-                shutil.rmtree(group_dir, ignore_errors=True)
+                    produced_records = False
+                finally:
+                    # Delete the source photo ONLY when we actually produced and
+                    # persisted output. On failure keep it in Dropbox so an
+                    # un-reshootable courthouse capture is never silently lost.
+                    mark_processed(
+                        dbx, group_items,
+                        delete_after=(delete_after and produced_records),
+                    )
+                    if not produced_records:
+                        logger.warning(
+                            "No records produced for %s/%s — %d source photo(s) "
+                            "NOT deleted (kept for re-OCR)",
+                            county, notice_type, len(group_items),
+                        )
+                    shutil.rmtree(group_dir, ignore_errors=True)
 
             # Clean up download temp dir
             for item in items:
