@@ -345,6 +345,28 @@ def test_lien_dedup_empty_instnum_not_collapsed():
     print("PASS: test_lien_dedup_empty_instnum_not_collapsed")
 
 
+def test_book_page_not_parsed_as_money():
+    """Regression (CR-02 / G2-CR-01): a deed book/page reference must NEVER be
+    parsed as a dollar amount. A judgment lien with a realistic
+    ``book_page='L 11234 567'`` and no real amount yields the conservative
+    unknown-lien haircut ($1), NOT 11234 / 567 / 11234567 — the bug that drove a
+    $40K home to ~ -$12M equity (and was masked because every other fixture sets
+    ``book_page=''`` + injects ``amount``)."""
+    from kentucky_equity_estimator import _record_amount, _UNKNOWN_LIEN_HAIRCUT
+    rec = DeedRecord(
+        instnum="2026051499", year="2026", db="", filed_date="2026-05-01",
+        book_page="L 11234 567", doc_type="JUDGMENT", grantor="", grantee="",
+        legal_desc="LOT 12 BLOCK 3", detail_url="", view_img="", xrefs=[],
+    )
+    # No amounts map, no .amount attribute -> must be 0 (was 11234567 via book_page).
+    assert _record_amount(rec, None) == 0, _record_amount(rec, None)
+    n = _notice(40000, decedent_name="WALKER JANE")
+    haircut, flags = _net_encumbrances(n, [rec], 40000.0)
+    assert "judgment" in flags, flags
+    assert haircut == _UNKNOWN_LIEN_HAIRCUT, f"book/page parsed as money: haircut={haircut}"
+    print("PASS: test_book_page_not_parsed_as_money")
+
+
 if __name__ == "__main__":
     test_wheatley_hecm()
     test_herflicker_hecm()
@@ -365,4 +387,5 @@ if __name__ == "__main__":
     test_lien_dedup_by_instnum()
     test_lien_dedup_preserves_distinct_instnums()
     test_lien_dedup_empty_instnum_not_collapsed()
+    test_book_page_not_parsed_as_money()
     print("\nALL TESTS PASSED")
