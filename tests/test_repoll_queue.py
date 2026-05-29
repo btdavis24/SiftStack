@@ -116,6 +116,10 @@ def test_make_key():
     setattr(n2, "filing_date", "2026-05-13")
     key2 = q.make_key(n2)
     assert key2 == "DOE JANE|2026-05-13", f"expected DOE JANE|2026-05-13, got {key2}"
+    # Real fix (G4-WR-02): with NO filing_date, the key uses the stable date_added
+    # field (not today's date), so it is identical across runs.
+    n2b = NoticeData(case_number="", decedent_name="ROE RICHARD", date_added="2026-05-10")
+    assert q.make_key(n2b) == "ROE RICHARD|2026-05-10", q.make_key(n2b)
     # empty decedent AND empty case -> "".
     n3 = NoticeData(case_number="", decedent_name="")
     assert q.make_key(n3) == "", f"empty decedent+case should be '', got {q.make_key(n3)!r}"
