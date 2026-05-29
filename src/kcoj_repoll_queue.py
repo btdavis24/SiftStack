@@ -69,7 +69,7 @@ def make_key(notice) -> str:
     """Queue key for a notice: case_number when present, else ``decedent|date``.
 
     A just-filed lead may not have a case_number yet (obituary-first discovery),
-    so we fall back to ``"<decedent_name>|<filing_date or today>"``. Returns ""
+    so we fall back to ``"<decedent_name>|<date_added or today>"``. Returns ""
     when there is neither a case number nor a decedent name to key on — the caller
     should not enqueue an unkeyable lead (``enqueue_repoll`` no-ops on a falsy key)."""
     case = (getattr(notice, "case_number", "") or "").strip()
@@ -78,7 +78,14 @@ def make_key(notice) -> str:
     decedent = (getattr(notice, "decedent_name", "") or "").strip()
     if not decedent:
         return ""
-    date = (getattr(notice, "filing_date", "") or "").strip() or datetime.now().strftime(_DATE_FMT)
+    # ``filing_date`` is NOT a NoticeData field (kept first for forward-compat if
+    # one is ever added); ``date_added`` IS the real per-lead field. Prefer it over
+    # datetime.now() — otherwise the same un-cased lead keys to a DIFFERENT date
+    # each run, defeating the attempts-cap / dedup idempotency (G4-WR-02 / G7-WR-04).
+    date = (
+        (getattr(notice, "filing_date", "") or getattr(notice, "date_added", "") or "").strip()
+        or datetime.now().strftime(_DATE_FMT)
+    )
     return f"{decedent}|{date}"
 
 

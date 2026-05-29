@@ -1,0 +1,49 @@
+# Build-context hygiene + secret exclusion (W7-WR-01).
+# The Dockerfile COPYs only requirements.txt, src/, and .actor/ — so the
+# security-critical lines below are the .actor/ credential files (a dev-placed
+# .actor/input.json would otherwise be baked into a persistent image layer by
+# `COPY .actor/ ./.actor/`). The rest just shrink the context sent to `apify push`.
+
+# ── Secrets / local inputs — NEVER bake into the image ──
+.env
+.env.*
+input.json
+.actor/input.json
+.actor/storage/
+cookies.json
+*_state.json
+*state.json
+last_run.json
+*.pem
+*.key
+*service*account*.json
+*-key.json
+
+# ── Version control + planning (local-only) ──
+.git/
+.gitignore
+.planning/
+
+# ── Local outputs / logs / data ──
+output/
+logs/
+data/
+
+# ── Python caches / virtualenvs ──
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# ── Dev-only material not needed in the Actor image ──
+tests/
+scripts/
+docs/
+assets/
+templates/
+Skills for REI/
+*.md

@@ -234,9 +234,14 @@ def build_summary(
     # paid-skip-trace floor (SKIP_TRACE_MIN_FIT).
     from collections import Counter
     demoted = Counter(n.fit_drop_reason for n in notices if n.fit_drop_reason)
+    def _fit_int(v):
+        try:
+            return int(str(v).strip())
+        except (TypeError, ValueError):
+            return None  # a stray "n/a"/"40 " must not crash the run summary (G7-WR-03)
     below_floor = sum(
         1 for n in notices
-        if n.wholesale_fit_score and int(n.wholesale_fit_score) < config.SKIP_TRACE_MIN_FIT
+        if (_s := _fit_int(n.wholesale_fit_score)) is not None and _s < config.SKIP_TRACE_MIN_FIT
     )
     if demoted or below_floor:
         parts = ", ".join(f"{k}: {v}" for k, v in demoted.most_common())

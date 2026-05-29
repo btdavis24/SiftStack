@@ -506,14 +506,24 @@ def get_detail(session: requests.Session, lrsn: str) -> dict[str, str]:
 
 # ── Apply result to notice ────────────────────────────────────────────
 
-_MONEY_RE = re.compile(r"[^\d]")
+# Keep the decimal point so cents are DROPPED, not concatenated. The old
+# r"[^\d]" stripped the '.' too, turning "$399,990.00" into "39999000" (100x the
+# real value) which then poisoned estimated_value / equity (G2-WR-04). Matches
+# jefferson_deeds_scraper._parse_money's int(float(...)) behaviour.
+_MONEY_RE = re.compile(r"[^\d.]")
 
 
 def _parse_money(s: str) -> str:
-    """'$399,990' -> '399990'. Empty on failure."""
+    """'$399,990.00' -> '399990' (cents dropped, NOT multiplied 100x). Empty on failure."""
     if not s:
         return ""
-    return _MONEY_RE.sub("", s)
+    cleaned = _MONEY_RE.sub("", s)
+    if not cleaned:
+        return ""
+    try:
+        return str(int(float(cleaned)))
+    except ValueError:
+        return ""
 
 
 def _apply_to_notice(
