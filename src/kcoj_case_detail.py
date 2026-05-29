@@ -467,24 +467,15 @@ def apply_parties_to_notice(notice: NoticeData, parties: list[dict]) -> None:
     if not parties:
         return
 
-    # ── Title-path awareness (Phase 2f) ──────────────────────────────
-    # The CourtNet executor governs only the personal estate; the person who
-    # can actually SELL is decided by title. Read notice.title_path (set by
-    # Step 3f / kentucky_title_classifier) to gate the executor->DM overwrite:
-    #   * successor_trustee / surviving_owner → a title-derived DM is already
-    #     in place; keep it (locked decision 1 — title overrides executor as
-    #     DM source). The executor is still captured into owner_name only.
-    #   * out_of_estate / no_property → flagged for drop by Phase 4; do NOT
-    #     silently name a DM here.
-    #   * trustee_unconfirmed → successor_trustee but no recoverable trustee:
-    #     intentionally falls back to the executor-as-DM path (locked
-    #     decision 3, Smith-Charles), so it is EXCLUDED from title_derived_dm.
-    tp = (notice.title_path or "").strip()
-    title_derived_dm = (
-        tp in ("successor_trustee", "surviving_owner")
-        and not notice.trustee_unconfirmed.strip()
-    )
-    skip_courtnet_dm = tp in ("out_of_estate", "no_property")
+    # ── DM capture (title-aware correction happens later, at Step 3f) ─
+    # The CourtNet executor governs only the personal estate; the party who can
+    # actually SELL is decided by TITLE. title_path is NOT known here — CourtNet
+    # (Step 3b.5) runs BEFORE the title classifier (Step 3f) precisely so the
+    # executor name is available as a deed-search fallback for Step 3c. We
+    # capture the executor as the PROVISIONAL decision-maker;
+    # kentucky_title_classifier.classify_title_path CORRECTS it once title_path
+    # is known — successor-trustee / surviving-owner override it, and
+    # out-of-estate / no-property clear it (locked decision 1, CR-01).
 
     seen_codes: list[str] = []
     executor_set = False
@@ -502,32 +493,13 @@ def apply_parties_to_notice(notice: NoticeData, parties: list[dict]) -> None:
         category = _classify_party(ptype)
         if category == "executor" and not executor_set and not notice.owner_name.strip():
             executor_name = _title_case_party(name)
-            # ALWAYS capture the executor into owner_name — the executor
-            # governs the personal estate, so this attorney/personal-estate
-            # contact must survive regardless of title path.
+            # Capture the executor into owner_name (the personal-estate contact,
+            # also Step 3c's deed-search fallback) AND set it as the PROVISIONAL
+            # decision-maker. classify_title_path (Step 3f) runs after this and
+            # CORRECTS the DM for trust / survivorship / out-of-estate (CR-01) —
+            # title overrides the executor as DM source (locked decision 1).
             notice.owner_name = executor_name
-            # GATE the decision_maker overwrite on title_path. Only let the
-            # CourtNet executor become the DM when title did NOT already name
-            # one (standard_probate / trustee_unconfirmed) AND this is not an
-            # out_of_estate / no_property drop case.
-            if title_derived_dm:
-                logger.info(
-                    "  [CourtNet] case %s: keeping title-derived DM (%s); "
-                    "executor %r captured to owner_name only",
-                    notice.case_number, tp, executor_name,
-                )
-            elif skip_courtnet_dm:
-                logger.info(
-                    "  [CourtNet] case %s: title_path=%s — skipping executor->DM "
-                    "assignment (flagged for drop)",
-                    notice.case_number, tp,
-                )
-            elif not notice.decision_maker_name.strip():
-                # standard_probate (or trustee_unconfirmed fallback): the
-                # executor IS the DM. Populate decision_maker_name so
-                # downstream consumers (DataSift CSV "Decision Maker" column,
-                # deep-prospecting, ranked-DM logic) see the executor without
-                # depending on a later obituary-enricher pass.
+            if not notice.decision_maker_name.strip():
                 notice.decision_maker_name = executor_name
                 notice.decision_maker_relationship = "executor"
                 notice.decision_maker_status = "verified_living"

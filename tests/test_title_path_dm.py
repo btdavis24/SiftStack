@@ -1,25 +1,22 @@
-"""Phase 2f — title-path-aware decision-maker assignment (2c integration).
+"""Phase 2f — title-path-aware decision-maker assignment (CR-01, end-to-end).
 
-Proves that ``kcoj_case_detail.apply_parties_to_notice`` honors
-``notice.title_path`` (set by Step 3f / kentucky_title_classifier) when it
-decides whether the CourtNet executor becomes the decision-maker:
+The CourtNet executor is the wrong DM ~26% of the time because TITLE bypasses or
+sits outside probate. This pins the locked rule across the REAL two-step flow:
 
-  * successor_trustee / surviving_owner → the title-derived DM is KEPT; the
-    executor is captured into owner_name only (locked decision 1).
-  * out_of_estate / no_property        → NO DM is named (flagged for drop).
-  * standard_probate                   → executor becomes the DM (current
-                                          behavior; relationship == "executor").
-  * trustee_unconfirmed                → falls back to executor as DM
-                                          (locked decision 3, Smith-Charles).
+  kcoj_case_detail.apply_parties_to_notice       -> sets a PROVISIONAL executor-DM
+  kentucky_title_classifier.classify_title_path  -> CORRECTS it:
+    * successor_trustee   -> DM := successor trustee (executor -> owner_name only)
+    * surviving_owner     -> DM := surviving co-owner
+    * out_of_estate / no_property -> DM cleared (no one to sell; Phase 4 drops it)
+    * standard_probate    -> DM stays the executor
+    * trustee_unconfirmed -> trust detected but no recoverable trustee -> executor
 
-Standalone script per .planning/codebase/TESTING.md (no pytest):
-``python tests/test_title_path_dm.py`` exits 0 when all assertions pass.
+Previously the classifier never set a DM and apply_parties read an always-empty
+title_path, so EVERY trust/survivorship lead silently shipped the executor as DM
+(CODE-REVIEW.md CR-01, W8-WR-04). These tests chain BOTH steps — the integration
+the prior isolated tests missed.
 
-Fixtures use the REAL executor party-type code ``"EE"`` (from
-``_EXECUTOR_PARTY_TYPES`` in src/kcoj_case_detail.py) so the executor branch
-genuinely fires — a placeholder/wrong code would make ``_classify_party``
-return "other", silently skip the executor branch, and make the
-executor-as-DM test pass vacuously.
+Run:  python tests/test_title_path_dm.py
 """
 
 import os
@@ -29,131 +26,95 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from notice_parser import NoticeData
 from kcoj_case_detail import apply_parties_to_notice
+from kentucky_title_classifier import classify_title_path
 
-# A real executor party-type code so _classify_party() returns "executor".
+# Real executor party-type code "EE" so _classify_party() returns "executor".
 EXECUTOR_PARTIES = [{"partyname": "DOE, JANE", "partytype": "EE"}]
-# Title-cased form apply_parties_to_notice writes for "DOE, JANE".
-EXECUTOR_TITLE = "Doe, Jane"
+EXECUTOR_TITLE = "Doe, Jane"   # title-cased form apply_parties writes
 
 
-def test_successor_trustee_keeps_title_dm():
-    """successor_trustee: the title-derived DM is preserved, not overwritten."""
-    n = NoticeData(
-        notice_type="probate", county="Jefferson", state="KY",
-        case_number="26-P-TEST1",
-        title_path="successor_trustee",
-        decision_maker_name="TRUSTEE NAME",  # as the classifier would leave it
-    )
+def _probate(**kw) -> NoticeData:
+    return NoticeData(notice_type="probate", county="Jefferson", state="KY", **kw)
+
+
+def _enrich(n: NoticeData) -> None:
+    """Run the real two-step flow: CourtNet parties, then the title classifier."""
     apply_parties_to_notice(n, EXECUTOR_PARTIES)
-    assert n.decision_maker_name == "TRUSTEE NAME", (
-        f"DM overwritten by executor: {n.decision_maker_name!r}"
-    )
-    assert n.owner_name == EXECUTOR_TITLE, (
-        f"executor not captured to owner_name: {n.owner_name!r}"
-    )
-    print("PASS: test_successor_trustee_keeps_title_dm")
+    # apply_parties sets the PROVISIONAL executor-DM + captures owner_name.
+    assert n.owner_name == EXECUTOR_TITLE, n.owner_name
+    assert n.decision_maker_name == EXECUTOR_TITLE, n.decision_maker_name
+    classify_title_path(n)
 
 
-def test_surviving_owner_keeps_title_dm():
-    """surviving_owner: the surviving co-owner stays DM; executor -> owner_name."""
-    n = NoticeData(
-        notice_type="probate", county="Jefferson", state="KY",
-        case_number="26-P-TEST2",
-        title_path="surviving_owner",
-        decision_maker_name="SURVIVING SPOUSE",
-    )
-    apply_parties_to_notice(n, EXECUTOR_PARTIES)
-    assert n.decision_maker_name == "SURVIVING SPOUSE", (
-        f"DM overwritten by executor: {n.decision_maker_name!r}"
-    )
-    assert n.owner_name == EXECUTOR_TITLE, (
-        f"executor not captured to owner_name: {n.owner_name!r}"
-    )
-    print("PASS: test_surviving_owner_keeps_title_dm")
+def test_successor_trustee_sets_trustee_dm():
+    n = _probate(case_number="26-P-T1", address="1 Trust Way",
+                 decedent_name="SMITH, JOHN",
+                 pva_owner_string="SMITH FAMILY REVOCABLE TRUST",
+                 current_property_holder="JANE SMITH",
+                 current_holder_relationship="trust")
+    _enrich(n)
+    assert n.title_path == "successor_trustee", n.title_path
+    assert n.decision_maker_name == "JANE SMITH", n.decision_maker_name
+    assert n.decision_maker_source == "title_successor_trustee", n.decision_maker_source
+    assert n.owner_name == EXECUTOR_TITLE, "executor must stay in owner_name"
+    print("PASS: test_successor_trustee_sets_trustee_dm")
 
 
-def test_out_of_estate_skips_dm():
-    """out_of_estate: no executor-as-DM (flagged for drop)."""
-    n = NoticeData(
-        notice_type="probate", county="Jefferson", state="KY",
-        case_number="26-P-TEST3",
-        title_path="out_of_estate",
-        decision_maker_name="",
-    )
-    apply_parties_to_notice(n, EXECUTOR_PARTIES)
-    assert n.decision_maker_name == "", (
-        f"DM should stay empty for out_of_estate: {n.decision_maker_name!r}"
-    )
-    print("PASS: test_out_of_estate_skips_dm")
+def test_surviving_owner_sets_survivor_dm():
+    n = _probate(case_number="26-P-T2", address="1 Joint St",
+                 decedent_name="DOE, JOHN",
+                 current_property_holder="JOHN DOE & JANE DOE")
+    _enrich(n)
+    assert n.title_path == "surviving_owner", n.title_path
+    assert n.decision_maker_name == "JANE DOE", n.decision_maker_name
+    assert n.decision_maker_source == "title_surviving_owner", n.decision_maker_source
+    assert n.owner_name == EXECUTOR_TITLE
+    print("PASS: test_surviving_owner_sets_survivor_dm")
 
 
-def test_no_property_skips_dm():
-    """no_property: no executor-as-DM (flagged for drop)."""
-    n = NoticeData(
-        notice_type="probate", county="Jefferson", state="KY",
-        case_number="26-P-TEST4",
-        title_path="no_property",
-        decision_maker_name="",
-    )
-    apply_parties_to_notice(n, EXECUTOR_PARTIES)
-    assert n.decision_maker_name == "", (
-        f"DM should stay empty for no_property: {n.decision_maker_name!r}"
-    )
-    print("PASS: test_no_property_skips_dm")
+def test_out_of_estate_clears_dm():
+    n = _probate(case_number="26-P-T3", address="100 Sold St",
+                 current_holder_relationship="heir_recent")
+    _enrich(n)
+    assert n.title_path == "out_of_estate", n.title_path
+    assert n.decision_maker_name == "", f"DM not cleared: {n.decision_maker_name!r}"
+    print("PASS: test_out_of_estate_clears_dm")
 
 
-def test_standard_probate_uses_executor():
-    """standard_probate: executor becomes the DM (current behavior preserved).
+def test_no_property_clears_dm():
+    n = _probate(case_number="26-P-T4")  # no address/holder/relationship
+    _enrich(n)
+    assert n.title_path == "no_property", n.title_path
+    assert n.decision_maker_name == "", f"DM not cleared: {n.decision_maker_name!r}"
+    print("PASS: test_no_property_clears_dm")
 
-    Uses the REAL "EE" executor party code so the executor branch actually
-    fires — asserting both decision_maker_name AND relationship proves this is
-    not a vacuous pass.
-    """
-    n = NoticeData(
-        notice_type="probate", county="Jefferson", state="KY",
-        case_number="26-P-TEST5",
-        title_path="standard_probate",
-        decision_maker_name="",
-    )
-    apply_parties_to_notice(n, EXECUTOR_PARTIES)
+
+def test_standard_probate_keeps_executor_dm():
+    n = _probate(case_number="26-P-T5", address="1 Main St", decedent_name="ROE, RICHARD")
+    _enrich(n)
+    assert n.title_path == "standard_probate", n.title_path
+    assert n.decision_maker_name == EXECUTOR_TITLE, n.decision_maker_name
+    assert n.decision_maker_relationship == "executor", n.decision_maker_relationship
+    print("PASS: test_standard_probate_keeps_executor_dm")
+
+
+def test_trustee_unconfirmed_keeps_executor_dm():
+    # Trust detected, but no recoverable trustee -> fall back to executor (locked decision 3).
+    n = _probate(case_number="26-P-T6", address="1 Trust Way",
+                 decedent_name="SMITH, JOHN", pva_owner_string="SMITH TRUST")
+    _enrich(n)
+    assert n.title_path == "successor_trustee", n.title_path
+    assert n.trustee_unconfirmed == "yes", n.trustee_unconfirmed
     assert n.decision_maker_name == EXECUTOR_TITLE, (
-        f"executor not set as DM: {n.decision_maker_name!r}"
-    )
-    assert n.decision_maker_relationship == "executor", (
-        f"DM relationship not 'executor': {n.decision_maker_relationship!r}"
-    )
-    assert n.owner_name == EXECUTOR_TITLE, (
-        f"executor not captured to owner_name: {n.owner_name!r}"
-    )
-    print("PASS: test_standard_probate_uses_executor")
-
-
-def test_trustee_unconfirmed_falls_back():
-    """trustee_unconfirmed: trust detected but no recoverable trustee → the
-    executor becomes the DM (locked decision 3, Smith-Charles)."""
-    n = NoticeData(
-        notice_type="probate", county="Jefferson", state="KY",
-        case_number="26-P-TEST6",
-        title_path="successor_trustee",
-        trustee_unconfirmed="yes",
-        decision_maker_name="",
-    )
-    apply_parties_to_notice(n, EXECUTOR_PARTIES)
-    assert n.decision_maker_name == EXECUTOR_TITLE, (
-        f"executor should be DM fallback when trustee_unconfirmed: "
-        f"{n.decision_maker_name!r}"
-    )
-    assert n.decision_maker_relationship == "executor", (
-        f"DM relationship not 'executor': {n.decision_maker_relationship!r}"
-    )
-    print("PASS: test_trustee_unconfirmed_falls_back")
+        f"executor must be the fallback DM: {n.decision_maker_name!r}")
+    print("PASS: test_trustee_unconfirmed_keeps_executor_dm")
 
 
 if __name__ == "__main__":
-    test_successor_trustee_keeps_title_dm()
-    test_surviving_owner_keeps_title_dm()
-    test_out_of_estate_skips_dm()
-    test_no_property_skips_dm()
-    test_standard_probate_uses_executor()
-    test_trustee_unconfirmed_falls_back()
+    test_successor_trustee_sets_trustee_dm()
+    test_surviving_owner_sets_survivor_dm()
+    test_out_of_estate_clears_dm()
+    test_no_property_clears_dm()
+    test_standard_probate_keeps_executor_dm()
+    test_trustee_unconfirmed_keeps_executor_dm()
     print("\nAll title-path DM-assignment tests passed.")

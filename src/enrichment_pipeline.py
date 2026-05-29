@@ -443,9 +443,11 @@ def run_enrichment_pipeline(
     # For Jefferson probate records with a case_number (populated by the
     # KCOJ docket scraper), look up the case's party list via CourtNet 2.0
     # guest access. Populates owner_name with the executor/administrator
-    # when visible, and estate_attorney_name with the estate's attorney.
-    # Runs BEFORE property lookup so downstream steps can use the resolved
-    # PR name as a fallback search term. Async-only (uses Playwright).
+    # when visible (also set as the PROVISIONAL decision-maker — Step 3f's title
+    # classifier corrects it for trust/survivorship/out-of-estate), and
+    # estate_attorney_name with the estate's attorney. Runs BEFORE property
+    # lookup so downstream steps can use the resolved PR name as a fallback
+    # search term. Async-only (uses Playwright).
     courtnet_candidates = [
         n for n in notices
         if n.notice_type == "probate"
@@ -614,9 +616,12 @@ def run_enrichment_pipeline(
     # ── Step 3f: KY Title-Path Classifier (Phase 2f) ─────────────────
     # Classify each Jefferson probate notice's title path (standard_probate /
     # successor_trustee / surviving_owner / out_of_estate / no_property) from
-    # the PVA owner string (Step 3d) + deed chain (Step 3c) vs DOD. Runs LAST
-    # in the KY block so the classifier sees the final 3c/3d/3e inputs, before
-    # the CourtNet party step uses title_path to route the decision-maker.
+    # the PVA owner string (Step 3d) + deed chain (Step 3c) vs DOD. Runs LAST in
+    # the KY block so the classifier sees the final 3c/3d/3e inputs — and,
+    # crucially, AFTER CourtNet (Step 3b.5): classify_title_path now CORRECTS the
+    # provisional executor-DM that 3b.5 set, overriding it with the successor
+    # trustee / surviving owner (or clearing it for out-of-estate/no-property).
+    # This is the locked "title overrides executor" rule (CR-01).
     # Gate on Jefferson + probate ONLY — NO address-absence filter: ALL
     # Jefferson probate notices must be classified (including those WITH a
     # property) so every one exits enrichment with a non-empty title_path. The
