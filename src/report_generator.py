@@ -15,6 +15,7 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
+from reportlab.lib.utils import escapeOnce
 from reportlab.platypus import (
     Paragraph,
     SimpleDocTemplate,
@@ -136,8 +137,24 @@ FOOTER_STYLE = ParagraphStyle(
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+def _esc(value) -> str:
+    """XML-escape an untrusted value for safe interpolation into reportlab
+    Paragraph markup. ``escapeOnce`` avoids double-escaping existing entities.
+    A literal &, <, or > in a real name ("SMITH & JONES ESTATE", an OCR'd
+    "AT&T") otherwise raises ValueError inside ``doc.build()`` and produces NO
+    PDF (W6-CR-01).
+    """
+    if value is None:
+        return ""
+    # escapeOnce handles & without double-escaping existing entities; it does
+    # NOT touch < or >, so escape those too (reportlab parses Paragraph markup).
+    return escapeOnce(str(value)).replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _val(value: str, fallback: str = "—") -> str:
-    return value.strip() if value and value.strip() else fallback
+    # Escape so every _val()-routed field is safe inside Paragraph markup;
+    # callers add structural markup (badges, <b>…) AROUND this escaped text.
+    return _esc(value.strip()) if value and value.strip() else fallback
 
 
 def _money(value: str) -> str:
@@ -232,7 +249,7 @@ def _address_slug(notice: NoticeData) -> str:
 
 def _bullet_list(items: list[str]) -> list:
     """Return a list of Paragraph flowables rendering plain strings as bullets."""
-    return [Paragraph(f"&#8226;&nbsp; {item}", BODY_STYLE) for item in items if item]
+    return [Paragraph(f"&#8226;&nbsp; {_esc(item)}", BODY_STYLE) for item in items if item]
 
 
 def _family_tree_table(grouped: dict[str, list[dict]]) -> Table | None:
@@ -244,7 +261,7 @@ def _family_tree_table(grouped: dict[str, list[dict]]) -> Table | None:
     for group_label, heirs in grouped.items():
         lines = []
         for heir in heirs:
-            name = (heir.get("name") or "").strip() or "—"
+            name = _esc((heir.get("name") or "").strip() or "—")
             status = (heir.get("status") or "").lower()
             if "deceased" in status:
                 name_html = f'<font color="#e94560">{name}</font>'
@@ -262,7 +279,7 @@ def _family_tree_table(grouped: dict[str, list[dict]]) -> Table | None:
             if heir.get("signing_authority"):
                 badges.append("signer")
             badge_str = f' <font color="#7f8c8d">[{", ".join(badges)}]</font>' if badges else ""
-            rel = (heir.get("relationship") or "").strip()
+            rel = _esc((heir.get("relationship") or "").strip())
             rel_str = f' <font color="#7f8c8d">— {rel}</font>' if rel else ""
             lines.append(f"{name_html}{rel_str}{badge_str}")
         rows.append((group_label, "<br/>".join(lines) or "—"))
@@ -425,7 +442,7 @@ def generate_record_pdf(
         story.append(_section_header("Deceased Owner Detection"))
         conf_text = _confidence_badge(notice.dm_confidence) if notice.dm_confidence else "—"
         if notice.dm_confidence_reason:
-            conf_text += f" — {notice.dm_confidence_reason}"
+            conf_text += f" — {_esc(notice.dm_confidence_reason)}"
         story.append(_data_table([
             ("Status", '<font color="#e94560"><b>DECEASED</b></font>'),
             ("Date of Death", _val(notice.date_of_death)),
@@ -440,7 +457,7 @@ def generate_record_pdf(
         story.append(_section_header("Decision Maker (Primary Contact)"))
         dm_addr = ""
         if notice.decision_maker_street:
-            dm_addr = (f"{notice.decision_maker_street}, "
+            dm_addr = (f"{_val(notice.decision_maker_street)}, "
                        f"{_val(notice.decision_maker_city)}, "
                        f"{_val(notice.decision_maker_state)} "
                        f"{_val(notice.decision_maker_zip)}")
@@ -483,7 +500,7 @@ def generate_record_pdf(
                     cleaned = clean_phone(val)
                     info = phone_tiers.get(cleaned, {})
                     if info.get("tier"):
-                        tier_str = f'  <font color="#7f8c8d">[{info["tier"]}, score={info["score"]}, {info.get("line_type", "")}]</font>'
+                        tier_str = f'  <font color="#7f8c8d">[{info["tier"]}, score={info.get("score", "")}, {info.get("line_type", "")}]</font>'
                 contact_rows.append((label, f"{val}{tier_str}"))
 
         # Emails
@@ -508,7 +525,16 @@ def generate_record_pdf(
     footer_parts.append(date_str)
     story.append(Paragraph(" &nbsp;|&nbsp; ".join(footer_parts), FOOTER_STYLE))
 
-    doc.build(story)
+    try:
+        doc.build(story)
+    except Exception:
+        logger.exception("PDF build failed for %s — removing partial file", pdf_path)
+        import os as _os
+        try:
+            _os.remove(str(pdf_path))
+        except OSError:
+            pass
+        raise
     logger.info("PDF report generated: %s", pdf_path)
     return pdf_path
 
@@ -528,6 +554,10 @@ def _add_signing_chain(
     except (json.JSONDecodeError, TypeError):
         story.append(Paragraph("(heir map parse error)", BODY_STYLE))
         return
+    if not isinstance(heirs, list):
+        story.append(Paragraph("(heir map malformed)", BODY_STYLE))
+        return
+    heirs = [h for h in heirs if isinstance(h, dict)]
 
     signers = [h for h in heirs
                if h.get("signing_authority") and h.get("status") != "deceased"]
@@ -537,8 +567,8 @@ def _add_signing_chain(
     from phone_validator import clean_phone
 
     for i, h in enumerate(signers, 1):
-        name = h.get("name", "?")
-        rel = h.get("relationship", "?").title()
+        name = _esc(h.get("name", "?"))
+        rel = _esc(h.get("relationship", "?")).title()
         status = _status_badge(h.get("status", "?"))
 
         story.append(Paragraph(
@@ -550,8 +580,8 @@ def _add_signing_chain(
 
         # Address
         if h.get("street"):
-            addr = (f"{h['street']}, {h.get('city', '')}, "
-                    f"{h.get('state', '')} {h.get('zip', '')}")
+            addr = (f"{_esc(h['street'])}, {_esc(h.get('city', ''))}, "
+                    f"{_esc(h.get('state', ''))} {_esc(h.get('zip', ''))}")
             rows.append(("Mailing Address", addr))
 
         # Phones
@@ -570,7 +600,7 @@ def _add_signing_chain(
                 cleaned = clean_phone(ph)
                 info = phone_tiers.get(cleaned, {})
                 if info.get("tier"):
-                    tier_str = f'  <font color="#7f8c8d">[{info["tier"]}, score={info["score"]}, {info.get("line_type", "")}]</font>'
+                    tier_str = f'  <font color="#7f8c8d">[{info["tier"]}, score={info.get("score", "")}, {info.get("line_type", "")}]</font>'
             rows.append((f"Phone {j}", f"{ph}{tier_str}"))
 
         # Emails
@@ -595,7 +625,7 @@ def _add_signing_chain(
         for h in non_signers[:8]:
             status = _status_badge(h.get("status", "?"))
             lines.append(
-                f"{h.get('name', '?')} ({h.get('relationship', '?').title()}) — {status}"
+                f"{_esc(h.get('name', '?'))} ({_esc(h.get('relationship', '?')).title()}) — {status}"
             )
         if len(non_signers) > 8:
             lines.append(f"... and {len(non_signers) - 8} more")
