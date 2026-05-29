@@ -301,11 +301,23 @@ def _drive_service():
 _SHARED_DRIVE_KW = {"supportsAllDrives": True, "includeItemsFromAllDrives": True}
 
 
+def _drive_q_escape(value: str) -> str:
+    """Escape a value for interpolation into a Drive ``q=`` query string (CR-06).
+
+    Drive queries use single-quoted string literals; the only correct escape is
+    to backslash-escape ``\\`` first, then ``'``. Without this, an address with an
+    apostrophe (e.g. ``O'Brien Ave``) breaks the query, and crafted operators
+    inside an unescaped value could broaden a match to the wrong property's
+    folder/files (wrong-property photos on a buyer-facing flyer).
+    """
+    return (value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
 def _find_subfolder(service, parent_id: str, name: str) -> str | None:
     """Find a child folder by case-insensitive name match. Tries exact match,
     then loose substring match. Returns folder ID or None."""
     q = (
-        f"'{parent_id}' in parents and "
+        f"'{_drive_q_escape(parent_id)}' in parents and "
         "mimeType='application/vnd.google-apps.folder' and trashed=false"
     )
     res = service.files().list(
@@ -325,7 +337,7 @@ def _find_subfolder(service, parent_id: str, name: str) -> str | None:
 
 def _list_images(service, folder_id: str) -> list[dict]:
     q = (
-        f"'{folder_id}' in parents and "
+        f"'{_drive_q_escape(folder_id)}' in parents and "
         "mimeType contains 'image/' and trashed=false"
     )
     res = service.files().list(
@@ -398,9 +410,9 @@ def _trash_existing_flyers(service, folder_id: str, filename: str) -> int:
     (Drive does not dedupe by name). Buyers should see one definitive PDF.
     Returns the count of files trashed (0 on first upload, 1+ on re-runs).
     """
-    safe = filename.replace("'", r"\'")
+    safe = _drive_q_escape(filename)
     res = service.files().list(
-        q=(f"'{folder_id}' in parents and name='{safe}' and trashed=false"),
+        q=(f"'{_drive_q_escape(folder_id)}' in parents and name='{safe}' and trashed=false"),
         fields="files(id,name)",
         **_SHARED_DRIVE_KW,
     ).execute()
