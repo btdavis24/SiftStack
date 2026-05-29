@@ -140,6 +140,35 @@ def test_living_dm_confirmed_passes():
     print("PASS: test_living_dm_confirmed_passes")
 
 
+def test_armstrong_wrong_age_real_scorer():
+    """Un-stubbed: the REAL disambiguate must demote a same-name wrong-age contact
+    below the 0.6 floor now that expected_age is wired through (CR-03).
+
+    Previously the guard never passed expected_age, so the age penalty could not
+    fire and a wrong-Barry's phone was confirmed and promoted to DM #1 — the
+    documented protection was dead in the primary path (W8-WR-02/03)."""
+    assert guard.disambiguate is not None, "resolver must be importable for this test"
+    n = NoticeData()
+    n.decision_maker_name = "Barry Armstrong"
+    n.date_of_death = "2024-02-01"
+    n.age_at_death = "78"           # expected age ~78 -> _expected_age_from_dod
+    n.address = "123 Real St"
+    n.primary_phone = "5025559999"
+    # Tracerfy attached a wildly wrong age (35 vs 78) + a non-matching address.
+    n.heir_map_json = json.dumps([
+        {"name": "Barry Armstrong", "status": "verified_living",
+         "age": 35, "addresses": ["999 Wrong Ave"],
+         "phones": [], "emails": []},
+    ])
+
+    r = guard.guard_traced_contacts(n)  # NO stub — real scorer runs
+
+    assert n.decision_maker_status == "unconfirmed", n.decision_maker_status
+    assert n.primary_phone == "5025559999", "phone must be HELD, not cleared/promoted"
+    assert r["unconfirmed"] is True, r
+    print("PASS: test_armstrong_wrong_age_real_scorer")
+
+
 def test_guard_all_aggregates():
     """guard_all rolls up suppressed/unconfirmed counts across a list."""
     n1 = NoticeData()
@@ -160,6 +189,7 @@ if __name__ == "__main__":
     test_davis_dead_spouse_dropped()
     test_deceased_heir_phones_suppressed()
     test_armstrong_wrong_age_unconfirmed()
+    test_armstrong_wrong_age_real_scorer()
     test_living_dm_confirmed_passes()
     test_guard_all_aggregates()
     print("\nALL PASS: skip_trace_guard")

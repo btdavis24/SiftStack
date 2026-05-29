@@ -292,6 +292,7 @@ def guard_traced_contacts(notice: NoticeData) -> dict:
                 if a:
                     known_addresses.append(a)
             expected_dod = (getattr(notice, "date_of_death", "") or "").strip() or None
+            expected_age = _expected_age_from_dod(notice)
 
             confirmed = True
             reason = ""
@@ -306,6 +307,7 @@ def guard_traced_contacts(notice: NoticeData) -> dict:
                     res = disambiguate(
                         dm_name, [candidate],
                         expected_dod=expected_dod,
+                        expected_age=expected_age,  # CR-03: enable the age-mismatch demotion (wrong-Barry)
                         known_addresses=known_addresses or None,
                         min_score=0.6,
                     )
@@ -365,8 +367,10 @@ def guard_traced_contacts(notice: NoticeData) -> dict:
 
 
 def _expected_age_from_dod(notice: NoticeData) -> int | None:
-    """Best-effort decedent age from any obituary age field — used only for the
-    degraded (no-Phase-1) explicit-mismatch fallback. Returns None when unknown."""
+    """Best-effort decedent age from any obituary age field. Fed to
+    ``disambiguate(expected_age=...)`` so the age-mismatch demotion can fire in the
+    primary path (CR-03), and reused by the degraded no-Phase-1 explicit-mismatch
+    fallback. Returns None when unknown."""
     for field in ("age_at_death", "decedent_age", "obit_age"):
         val = getattr(notice, field, None)
         if val:
