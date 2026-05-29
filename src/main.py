@@ -34,39 +34,11 @@ logger = logging.getLogger(__name__)
 # ── Shared helpers ────────────────────────────────────────────────────
 
 
-def is_tracerfy_eligible(notice, min_fit: int) -> bool:
-    """Decide whether a NoticeData record should be sent to Tracerfy.
-
-    Two-gate predicate matching the inline list comprehension in actor_main:
-      1. Fit gate: wholesale_fit_score >= min_fit (fails closed on blank/0).
-      2. Secondary gate: at least one of
-         - deceased owner (probate happy path),
-         - heir_map_json (signing heirs to trace),
-         - decision_maker_name (named PR/executor),
-         - lis_pendens record with owner_name + address (living-owner trace).
-
-    Extracted from the inline gate so the predicate is independently testable
-    without mocking the full actor_main flow.
-    """
-    try:
-        score = int(notice.wholesale_fit_score or 0)
-    except (TypeError, ValueError):
-        return False
-    if score < min_fit:
-        return False
-    if notice.owner_deceased == "yes":
-        return True
-    if notice.heir_map_json:
-        return True
-    if notice.decision_maker_name:
-        return True
-    if (
-        notice.notice_type == "lis_pendens"
-        and notice.owner_name
-        and notice.address
-    ):
-        return True
-    return False
+# is_tracerfy_eligible moved to skip_trace_guard (single source of truth shared
+# by the daily pipeline, deep-prospect, and the Dropbox watcher so every
+# paid-trace path applies the identical Phase-4 gate — W5-CR-02). Re-exported
+# here so existing callers and `from main import is_tracerfy_eligible` keep working.
+from skip_trace_guard import is_tracerfy_eligible  # noqa: E402,F401
 
 
 def _filter_searches(

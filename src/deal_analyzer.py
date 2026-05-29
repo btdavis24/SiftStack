@@ -251,10 +251,21 @@ def calculate_flip(arv_mid: float, purchase_price: float, rehab_cost: float,
 
 def calculate_wholesale(arv_mid: float, contract_price: float,
                         rehab_cost: float,
+                        holding_total: float = 0.0,
                         assignment_fee: float = DEFAULT_WHOLESALE_FEE) -> WholesaleProjection:
-    """Calculate wholesale assignment projection."""
-    buyer_total = contract_price + assignment_fee + rehab_cost
-    buyer_profit = arv_mid - buyer_total - (arv_mid * (DEFAULT_AGENT_COMMISSION + DEFAULT_CLOSING_COSTS_PCT))
+    """Calculate wholesale assignment projection.
+
+    The end-buyer's economics are charged on the SAME basis as ``calculate_flip``
+    — contract + assignment fee + rehab + HOLDING + full selling costs (incl.
+    transfer tax) — so FLIP and WHOLESALE are comparable in ``_make_recommendation``
+    (W3-CR-01). Pass the WHOLESALE MAO as ``contract_price`` (not the flip MAO),
+    otherwise the buyer's all-in is understated and the spread double-counted.
+    """
+    buyer_selling = arv_mid * (
+        DEFAULT_AGENT_COMMISSION + DEFAULT_CLOSING_COSTS_PCT + DEFAULT_TRANSFER_TAX_PCT
+    )
+    buyer_total = contract_price + assignment_fee + rehab_cost + holding_total + buyer_selling
+    buyer_profit = arv_mid - buyer_total
 
     return WholesaleProjection(
         arv=round(arv_mid),
@@ -410,7 +421,14 @@ def _make_recommendation(flip: FlipProjection, wholesale: WholesaleProjection,
     if flip.roi_pct >= 25 and flip.net_profit >= 25000:
         strategies.append(("FLIP", flip.roi_pct, f"${flip.net_profit:,.0f} profit, {flip.roi_pct:.0f}% ROI"))
     if wholesale.assignment_fee >= 5000 and wholesale.buyer_profit_estimate > 20000:
-        strategies.append(("WHOLESALE", 100, f"${wholesale.assignment_fee:,.0f} assignment fee, buyer profits ${wholesale.buyer_profit_estimate:,.0f}"))
+        # Rank on the wholesaler's spread as a % of the contract price — a real,
+        # bounded metric comparable to flip ROI / hold CoC — instead of a flat
+        # 100 that silently dominated every other strategy (W3-WR-05).
+        wholesale_score = (
+            (wholesale.assignment_fee / wholesale.contract_price * 100)
+            if wholesale.contract_price > 0 else 0
+        )
+        strategies.append(("WHOLESALE", wholesale_score, f"${wholesale.assignment_fee:,.0f} assignment fee, buyer profits ${wholesale.buyer_profit_estimate:,.0f}"))
     if hold.cash_on_cash >= 8:
         strategies.append(("BUY & HOLD", hold.cash_on_cash, f"{hold.cash_on_cash:.1f}% CoC, ${hold.cash_flow_annual:,.0f}/yr cash flow"))
 
@@ -727,7 +745,11 @@ def run_deal_analysis(address: str, city: str = "", state: str = "TN",
 
     flip = calculate_flip(arv.arv_mid, purchase_price, rehab_full.grand_total,
                           holding, selling, rehab_months)
-    wholesale = calculate_wholesale(arv.arv_mid, purchase_price, rehab_full.grand_total)
+    # Contract at the WHOLESALE MAO (not the flip MAO / user purchase price) and
+    # charge the buyer's holding costs so the buyer-profit estimate is consistent
+    # with the flip path (W3-CR-01).
+    wholesale = calculate_wholesale(arv.arv_mid, mao.wholesale_mao,
+                                    rehab_full.grand_total, holding.total)
     hold = calculate_hold(purchase_price, rehab_full.grand_total, arv.arv_mid,
                           subject.sqft, subject.bedrooms)
     financing = calculate_financing(purchase_price, rehab_full.grand_total)

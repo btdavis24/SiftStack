@@ -20,6 +20,8 @@ Usage:
 
 import csv
 import logging
+
+from csv_safety import SafeDictWriter
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -398,7 +400,7 @@ def export_buyers_csv(investors: list[InvestorProfile], output_path: str = "") -
 
     headers = ["owner_name", "address", "city", "state", "zip", "tags", "lists", "notes"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
+        writer = SafeDictWriter(f, fieldnames=headers)
         writer.writeheader()
         for inv in investors[:100]:
             writer.writerow({

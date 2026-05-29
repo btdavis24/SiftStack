@@ -181,23 +181,24 @@ def _record_amount(rec: DeedRecord, amounts: dict[str, int] | None) -> int:
     """Best-effort dollar figure for a deed/lien record.
 
     Resolution order:
-      1. A live-scan ``amounts`` map keyed by ``instnum`` (filled by
-         ``scan_liens`` from ``_fetch_pdetail``).
-      2. An optional ``amount`` attribute on the record (tests set this so the
-         suite needs no network and no pdetail fetch).
-      3. ``_parse_money`` over the record's free-text fields (book_page /
-         legal_desc sometimes embed a dollar figure).
-    Returns 0 when nothing parseable is found (caller decides the placeholder).
+      1. A live-scan ``amounts`` map keyed by ``instnum``.
+      2. An ``amount`` attribute on the record — set by ``scan_liens`` from the
+         pdetail page in production (``_fill_record_amounts``) and directly by
+         unit-test fixtures.
+    Returns 0 when no real dollar source exists; the caller then applies a
+    conservative placeholder.
+
+    We do NOT parse ``book_page`` / ``legal_desc`` / ``doc_type`` as money. A
+    book/page reference like ``"D 12345 678"`` is NOT a dollar figure — parsing
+    it produced a $12.3M phantom haircut and wildly negative equity in
+    production (CR-02 / G2-CR-01), masked because every test fixture set
+    ``book_page=""`` and injected ``amount`` directly.
     """
     if amounts and rec.instnum in amounts:
         return amounts[rec.instnum]
     attr = getattr(rec, "amount", None)
     if attr is not None:
         return _parse_money(str(attr))
-    for field_val in (rec.book_page, rec.legal_desc, rec.doc_type):
-        parsed = _parse_money(field_val or "")
-        if parsed > 0:
-            return parsed
     return 0
 
 
@@ -340,6 +341,59 @@ def _net_encumbrances(
     return haircut, ordered
 
 
+def _fill_record_amounts(opener, records: list[DeedRecord] | None) -> None:
+    """Fetch each NETTABLE record's dollar principal from its pdetail page and
+    stash it on ``rec.amount`` (read by ``_record_amount`` path 2).
+
+    Only mortgages (``Mort $``) and tax certificates (``Tax $``) carry a clean
+    pdetail amount; judgment / lis_pendens liens have none, so they fall to the
+    caller's conservative unknown-lien haircut. Per-record failures are logged
+    and skipped — they never abort the sweep (equity degrades to flag-only).
+    Cached by instnum (the same filing is re-indexed under multiple name
+    variations on JCD).
+    """
+    if not records:
+        return
+    try:
+        from jefferson_deeds_scraper import _fetch_pdetail
+        from jefferson_deeds_scraper import _parse_money as _jcd_money
+    except ImportError:
+        return
+    cache: dict[str, int] = {}
+    for rec in records:
+        if getattr(rec, "amount", None) is not None or not getattr(rec, "detail_url", ""):
+            continue
+        try:
+            group = _classify(rec.doc_type)
+            bucket = _classify_lien(rec.doc_type, f"{rec.grantor or ''} {rec.grantee or ''}")
+        except Exception:  # noqa: BLE001
+            continue
+        is_mortgage = group == "mortgage" or bucket == "hecm"
+        is_tax = bucket == "tax_cert"
+        if not (is_mortgage or is_tax):
+            continue  # judgment / lis_pendens have no clean pdetail amount
+        if rec.instnum and rec.instnum in cache:
+            rec.amount = cache[rec.instnum]
+            continue
+        try:
+            detail = _fetch_pdetail(opener, rec.detail_url)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never abort
+            logger.debug("  [Equity] pdetail fetch failed for %s: %s", rec.instnum, exc)
+            continue
+        if not detail:
+            continue
+        raw = detail.get("tax_amount" if is_tax else "mort_amount", "")
+        try:
+            amt = int(_jcd_money(raw)) if raw else 0
+        except (TypeError, ValueError):
+            amt = 0
+        if amt > 0:
+            rec.amount = amt
+            if rec.instnum:
+                cache[rec.instnum] = amt
+            logger.debug("  [Equity] pdetail amount for %s: $%s", rec.instnum, f"{amt:,}")
+
+
 def scan_liens(
     notice: "NoticeData",
     opener=None,
@@ -389,6 +443,12 @@ def scan_liens(
             return []
         all_records = _parse_deed_list(html)
         logger.debug("  [Equity] scanned %d deed/lien records for %r", len(all_records), query)
+        # Enrich nettable records with their real dollar principal from pdetail
+        # (G2-WR-02 full fix). Best-effort: failures degrade to flag-only equity.
+        try:
+            _fill_record_amounts(opener, all_records)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("  [Equity] amount enrichment failed (flag-only equity): %s", exc)
         return all_records
     except Exception as exc:  # noqa: BLE001 — network is best-effort
         logger.warning("  [Equity] lien scan failed (degrading to existing fields): %s", exc)

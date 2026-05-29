@@ -159,13 +159,16 @@ def _extract_successor_trustee(notice: "NoticeData") -> str:
     return ""
 
 
-def _is_surviving_owner(notice: "NoticeData") -> bool:
-    """True when the latest deed has 2+ grantees and a co-owner is alive.
+def _surviving_owner_name(notice: "NoticeData") -> str:
+    """Return the alive co-owner's name when the latest deed has 2+ grantees and
+    a co-owner is alive, else "".
 
     Detect 2+ grantees from the deed-derived ``current_property_holder`` string
     (a multi-name holder joined by "&" / "AND" / ","). A co-owner is "alive" in
     v1 when its name differs from ``decedent_name`` AND is NOT in the obituary
-    ``preceded_in_death`` set (locked decision 4 — no paid death index).
+    ``preceded_in_death`` set (locked decision 4 — no paid death index). The
+    returned name is the surviving co-owner who becomes the decision-maker
+    (CR-01); "" means standard probate.
 
     NOTE (future enhancement): Phase 1 ``kentucky_name_resolver`` name-variant
     disambiguation would tighten the same-name match here. It is intentionally
@@ -174,11 +177,11 @@ def _is_surviving_owner(notice: "NoticeData") -> bool:
     """
     holder = (notice.current_property_holder or "").strip()
     if not holder:
-        return False
+        return ""
     parts = [p.strip() for p in _MULTI_GRANTEE_SPLIT_RE.split(holder) if p.strip()]
     # Need at least two distinct name components to be a joint/survivorship deed.
     if len(parts) < 2:
-        return False
+        return ""
 
     dec_surname = _surname(notice.decedent_name)
     dec_name_u = (notice.decedent_name or "").strip().upper()
@@ -200,8 +203,35 @@ def _is_surviving_owner(notice: "NoticeData") -> bool:
             continue
         if _component_is_decedent(part_u, dec_name_u, dec_surname):
             continue
-        return True
-    return False
+        return part  # the surviving co-owner (original deed casing)
+    return ""
+
+
+def _set_title_dm(notice, name: str, relationship: str, source: str, reason: str) -> bool:
+    """Set the title-derived decision-maker, OVERRIDING the provisional CourtNet
+    executor for trust / survivorship paths (locked decision 1, CR-01).
+    Returns True when a DM was set."""
+    name = (name or "").strip()
+    if not name:
+        return False
+    notice.decision_maker_name = name
+    notice.decision_maker_relationship = relationship
+    notice.decision_maker_status = "unverified"  # title-derived; not yet contacted
+    notice.decision_maker_source = source
+    notice.dm_confidence = "medium"
+    notice.dm_confidence_reason = reason
+    return True
+
+
+def _clear_title_dm(notice, reason: str) -> None:
+    """Clear any provisional DM — out-of-estate / no-property leads have no party
+    who can sell the real property, so no DM is named (CR-01; Phase 4 drops them)."""
+    notice.decision_maker_name = ""
+    notice.decision_maker_relationship = ""
+    notice.decision_maker_status = ""
+    notice.decision_maker_source = ""
+    notice.dm_confidence = ""
+    notice.dm_confidence_reason = reason
 
 
 def _component_is_decedent(part_u: str, dec_name_u: str, dec_surname: str) -> bool:
@@ -246,6 +276,7 @@ def classify_title_path(notice: "NoticeData") -> None:
         if not address and not holder and not relationship:
             notice.title_path = "no_property"
             notice.dm_can_sell_without_probate = ""
+            _clear_title_dm(notice, "renter / no real property — no decision-maker named")
             return
 
         # ── Rule 2: out_of_estate ────────────────────────────────────
@@ -269,6 +300,7 @@ def classify_title_path(notice: "NoticeData") -> None:
             notice.title_path = "out_of_estate"
             # Keep the new grantee already captured by 3c in current_property_holder.
             notice.dm_can_sell_without_probate = ""
+            _clear_title_dm(notice, "decedent left title before death — no estate DM named")
             return
 
         # ── Rule 3: successor_trustee ────────────────────────────────
@@ -281,9 +313,17 @@ def classify_title_path(notice: "NoticeData") -> None:
             notice.dm_can_sell_without_probate = "yes"
             notice.needs_trustee_research = "yes"
             trustee = _extract_successor_trustee(notice)
-            if not trustee:
-                # Trust agreement unrecorded / not recoverable → fall back to
-                # the CourtNet executor downstream (locked decision 3).
+            if trustee:
+                # Title overrides the provisional CourtNet executor as DM source
+                # (locked decision 1, CR-01) — the successor trustee can sell.
+                _set_title_dm(
+                    notice, trustee, "successor_trustee", "title_successor_trustee",
+                    "deed shows a revocable/living trust; the successor trustee "
+                    "can sell without closing probate",
+                )
+            else:
+                # Trust agreement unrecorded / not recoverable → keep the
+                # provisional CourtNet executor as DM (locked decision 3).
                 notice.trustee_unconfirmed = "yes"
             return
 
@@ -291,9 +331,16 @@ def classify_title_path(notice: "NoticeData") -> None:
         # Latest deed has 2+ grantees (joint/TBE/JTWROS) AND a co-owner is alive
         # (not the decedent, not in obituary preceded_in_death). (Hale, Karem,
         # Koch/TBE, Pfeifer, Wagner, Layton, Martin-Bluffview.)
-        if _is_surviving_owner(notice):
+        survivor = _surviving_owner_name(notice)
+        if survivor:
             notice.title_path = "surviving_owner"
             notice.dm_can_sell_without_probate = "yes"
+            # Surviving co-owner bypasses probate → they are the DM, not the
+            # personal-estate executor (locked decision 1, CR-01).
+            _set_title_dm(
+                notice, survivor, "surviving_owner", "title_surviving_owner",
+                "joint/survivorship deed; the surviving co-owner bypasses probate",
+            )
             return
 
         # ── Rule 5: standard_probate (default) ───────────────────────

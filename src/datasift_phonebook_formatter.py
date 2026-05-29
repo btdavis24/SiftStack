@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+from csv_safety import SafeDictWriter
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ def write_phonebook_csv(
     path = output_dir / f"datasift_phonebook_{timestamp}.csv"
 
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=_HEADERS)
+        writer = SafeDictWriter(f, fieldnames=_HEADERS)
         writer.writeheader()
         writer.writerows(rows)
 

@@ -38,6 +38,7 @@ from datetime import datetime, timedelta
 
 import config
 from kentucky_name_resolver import SUFFIX_RE, generate_variants
+from csv_safety import SafeDictWriter
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -955,7 +956,7 @@ def export_deed_transfers_csv(transfers: list[DeedTransfer], output_path) -> str
     fields = ["instnum", "year", "db", "detail_url", "grantor", "grantees",
               "primary_grantee", "legal_desc", "date_filed", "book_page"]
     with open(p, "w", newline="", encoding="utf-8") as f:
-        w = _csv.DictWriter(f, fieldnames=fields)
+        w = SafeDictWriter(f, fieldnames=fields)
         w.writeheader()
         for t in transfers:
             w.writerow({

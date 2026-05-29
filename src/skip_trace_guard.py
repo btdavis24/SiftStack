@@ -51,6 +51,40 @@ except ImportError:  # pragma: no cover - phone_validator is always present in-t
 # DM #1 email block (flat fields).
 DM_EMAIL_FIELDS = ["email_1", "email_2", "email_3", "email_4", "email_5"]
 
+
+def is_tracerfy_eligible(notice: NoticeData, min_fit: int) -> bool:
+    """Decide whether a NoticeData record should be sent to Tracerfy.
+
+    SINGLE SOURCE OF TRUTH for the paid-skip-trace gate, shared by the
+    daily/Apify pipeline, deep-prospect, AND the Dropbox watcher so every
+    ingestion path applies the identical Phase-4 gate (W5-CR-02). Two gates:
+      1. Fit gate: wholesale_fit_score >= min_fit (fails CLOSED on blank/0).
+      2. Secondary gate: at least one of
+         - deceased owner (probate happy path),
+         - heir_map_json (signing heirs to trace),
+         - decision_maker_name (named PR/executor),
+         - lis_pendens record with owner_name + address (living-owner trace).
+    """
+    try:
+        score = int(notice.wholesale_fit_score or 0)
+    except (TypeError, ValueError):
+        return False
+    if score < min_fit:
+        return False
+    if notice.owner_deceased == "yes":
+        return True
+    if notice.heir_map_json:
+        return True
+    if notice.decision_maker_name:
+        return True
+    if (
+        notice.notice_type == "lis_pendens"
+        and notice.owner_name
+        and notice.address
+    ):
+        return True
+    return False
+
 # Phase 1 identity resolver — imported DEFENSIVELY. If Phase 1's module is not
 # present at execution time, the identity-confirmation half degrades to "flag
 # unconfirmed only on an explicit mismatch" rather than crashing. The
@@ -258,6 +292,7 @@ def guard_traced_contacts(notice: NoticeData) -> dict:
                 if a:
                     known_addresses.append(a)
             expected_dod = (getattr(notice, "date_of_death", "") or "").strip() or None
+            expected_age = _expected_age_from_dod(notice)
 
             confirmed = True
             reason = ""
@@ -272,6 +307,7 @@ def guard_traced_contacts(notice: NoticeData) -> dict:
                     res = disambiguate(
                         dm_name, [candidate],
                         expected_dod=expected_dod,
+                        expected_age=expected_age,  # CR-03: enable the age-mismatch demotion (wrong-Barry)
                         known_addresses=known_addresses or None,
                         min_score=0.6,
                     )
@@ -331,8 +367,10 @@ def guard_traced_contacts(notice: NoticeData) -> dict:
 
 
 def _expected_age_from_dod(notice: NoticeData) -> int | None:
-    """Best-effort decedent age from any obituary age field — used only for the
-    degraded (no-Phase-1) explicit-mismatch fallback. Returns None when unknown."""
+    """Best-effort decedent age from any obituary age field. Fed to
+    ``disambiguate(expected_age=...)`` so the age-mismatch demotion can fire in the
+    primary path (CR-03), and reused by the degraded no-Phase-1 explicit-mismatch
+    fallback. Returns None when unknown."""
     for field in ("age_at_death", "decedent_age", "obit_age"):
         val = getattr(notice, field, None)
         if val:

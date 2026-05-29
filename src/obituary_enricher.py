@@ -2133,9 +2133,21 @@ def _apply_obituary_match(
         except Exception as e:
             logger.warning("  Name variant generation failed for %s: %s", decedent_name, e)
 
+    # CR-01: when the title classifier (Step 3f) already named a title-derived DM
+    # (successor trustee / surviving owner), the obituary enricher must NOT
+    # overwrite DM #1 with the executor / survivor pick — title overrides the
+    # executor as DM source (locked decision 1). Supplementary heir data
+    # (heir_map_json, signing chain, DM 2/3) may still populate below.
+    title_dm_locked = (
+        (getattr(notice, "title_path", "") or "").strip()
+        in ("successor_trustee", "surviving_owner")
+        and not (getattr(notice, "trustee_unconfirmed", "") or "").strip()
+        and (getattr(notice, "decision_maker_name", "") or "").strip()
+    )
+
     if ranked_dms:
         # Deep prospecting: apply top 3 ranked decision-makers
-        if len(ranked_dms) >= 1:
+        if len(ranked_dms) >= 1 and not title_dm_locked:
             dm = ranked_dms[0]
             notice.decision_maker_name = dm["name"]
             notice.decision_maker_relationship = dm["relationship"]
@@ -2146,6 +2158,12 @@ def _apply_obituary_match(
             notice.decision_maker_city = dm.get("city", "")
             notice.decision_maker_state = dm.get("state", "")
             notice.decision_maker_zip = dm.get("zip", "")
+        elif title_dm_locked:
+            logger.info(
+                "  Obituary: keeping title-derived DM %r (title_path=%s) — "
+                "not overwriting with the obituary pick",
+                notice.decision_maker_name, notice.title_path,
+            )
         if len(ranked_dms) >= 2:
             dm = ranked_dms[1]
             notice.decision_maker_2_name = dm["name"]
@@ -2168,7 +2186,7 @@ def _apply_obituary_match(
         ]
         notice.signing_chain_count = str(len(signers)) if signers else ""
         notice.signing_chain_names = ", ".join(e["name"] for e in signers) if signers else ""
-    else:
+    elif not title_dm_locked:
         # Simple single-DM pick (Phase A only, no heir verification)
         survivors = parsed.get("survivors", [])
         executor = parsed.get("executor_named", "")

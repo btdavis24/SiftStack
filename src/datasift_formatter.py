@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config import OUTPUT_DIR
+from csv_safety import SafeDictWriter
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -868,7 +869,7 @@ def write_datasift_csv(
     issue_counts: dict[str, int] = {}
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+        writer = SafeDictWriter(f, fieldnames=DATASIFT_COLUMNS)
         writer.writeheader()
 
         for notice in notices:
@@ -924,7 +925,7 @@ def write_datasift_split_csvs(
     incomplete = 0
     issue_counts: dict[str, int] = {}
     with open(dm_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+        writer = SafeDictWriter(f, fieldnames=DATASIFT_COLUMNS)
         writer.writeheader()
         for notice in notices:
             row = _build_row(notice, notes_override=_build_dm_notes(notice))
@@ -959,7 +960,7 @@ def write_datasift_split_csvs(
         heir_path = OUTPUT_DIR / f"datasift_upload_Heirs_{timestamp}.csv"
         heir_written = 0
         with open(heir_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+            writer = SafeDictWriter(f, fieldnames=DATASIFT_COLUMNS)
             writer.writeheader()
             for notice in deceased_with_heirs:
                 row = _build_row(notice, notes_override=_build_heir_notes(notice))
