@@ -207,7 +207,10 @@ async def actor_main() -> None:
         counties = actor_input.get("counties") or None
         types = actor_input.get("types") or None
         since_date_override = actor_input.get("since_date", "").strip()
-        start_page = int(actor_input.get("start_page", 1) or 1)
+        try:
+            start_page = max(1, int(actor_input.get("start_page", 1) or 1))
+        except (TypeError, ValueError):
+            start_page = 1  # malformed operator input must not crash the Actor (G7-WR-05)
         drive_folder_id = actor_input.get("google_drive_folder_id", "")
         drive_key_b64 = actor_input.get("google_service_account_key", "")
 
@@ -484,7 +487,7 @@ async def actor_main() -> None:
                 try:
                     return int(score) >= int(thr)
                 except (TypeError, ValueError):
-                    return True
+                    return False  # non-empty unparseable score → fail CLOSED (G5-WR-02)
 
             if do_tracerfy and config.TRACERFY_API_KEY:
                 # Two-gate eligibility (see is_tracerfy_eligible docstring):
@@ -2159,17 +2162,19 @@ def _run_scrape_pipeline(args, searches) -> None:
             try:
                 return int(score) >= int(thr)
             except (TypeError, ValueError):
-                return True
+                return False  # non-empty unparseable score → fail CLOSED (G5-WR-02)
 
         if cfg.TRACERFY_API_KEY:
             from tracerfy_skip_tracer import batch_skip_trace
             # Fit gate (Phase 4): below-fit leads are not submitted to paid
             # Tracerfy. Parse wholesale_fit_score defensively so an unscored/blank
             # record fails CLOSED (scores 0 → excluded), never crashing the gate.
-            trace_candidates = [
-                n for n in notices
-                if int(n.wholesale_fit_score or 0) >= cfg.SKIP_TRACE_MIN_FIT
-            ]
+            def _fit_ok(n) -> bool:
+                try:
+                    return int(n.wholesale_fit_score or 0) >= cfg.SKIP_TRACE_MIN_FIT
+                except (TypeError, ValueError):
+                    return False  # unscored/garbage → fail CLOSED, never pay to trace (G6-WR-04)
+            trace_candidates = [n for n in notices if _fit_ok(n)]
             # Defensive no-op on top of Phase 4's gate (no double-apply).
             trace_candidates = [n for n in trace_candidates if _passes_fit_gate(n)]
             logging.info("Tracerfy fit-gate: %d/%d records >= SKIP_TRACE_MIN_FIT (%d)",
