@@ -25,6 +25,8 @@ Usage:
 """
 
 import csv
+
+from csv_safety import SafeDictWriter
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -164,7 +166,7 @@ def export_sms_list(records: list[dict], day: int = 1,
     template = sms_templates.get(day, sms_templates[1])
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "phone", "message", "address"])
+        writer = SafeDictWriter(f, fieldnames=["name", "phone", "message", "address"])
         writer.writeheader()
         for rec in records:
             name = rec.get("owner_name") or rec.get("full_name") or "there"
@@ -219,7 +221,7 @@ def export_call_list(records: list[dict], day: int = 1,
 
     fields = ["name", "phone", "phone_2", "phone_3", "tier", "address", "notice_type", "notes"]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer = SafeDictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(call_records)
 
@@ -240,7 +242,7 @@ def export_mail_list(records: list[dict], output_path: str = "") -> str:
               "city", "state", "zip", "property_address", "notice_type"]
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = SafeDictWriter(f, fieldnames=fields)
         writer.writeheader()
         for rec in records:
             name = rec.get("owner_name") or rec.get("full_name") or ""

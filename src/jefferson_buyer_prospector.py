@@ -28,6 +28,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 import config
+
+from csv_safety import SafeDictWriter
 from datasift_sold_properties import (
     SoldProperty, scrape_sold_properties, export_sold_csv,
 )
@@ -570,7 +572,7 @@ def export_buyers_csv(rankings: list[BuyerRanking], output_path: str | Path) -> 
         "owner_name", "address", "city", "state", "zip", "tags", "lists", "notes",
     ]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
+        writer = SafeDictWriter(f, fieldnames=headers)
         writer.writeheader()
         for r in target_buyers:
             tags = [

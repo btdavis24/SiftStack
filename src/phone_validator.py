@@ -23,6 +23,8 @@ import json
 import logging
 import os
 import re
+
+from csv_safety import SafeDictWriter
 import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -522,7 +524,7 @@ def write_detailed_csv(results: list[dict], output_dir: str | Path) -> Path:
         "is_valid", "is_prepaid", "assigned_tag", "is_litigator_risk",
     ]
     with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = SafeDictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in results:
             writer.writerow({k: r.get(k, "") for k in fieldnames})

@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config import OUTPUT_DIR
+from csv_safety import SafeDictWriter
 from notice_parser import NoticeData
 
 logger = logging.getLogger(__name__)
@@ -214,7 +215,7 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
     written = 0
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=SIFT_COLUMNS)
+        writer = SafeDictWriter(f, fieldnames=SIFT_COLUMNS)
         writer.writeheader()
 
         for notice in notices:

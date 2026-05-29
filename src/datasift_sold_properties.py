@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import asyncio
 import csv
+
+from csv_safety import SafeDictWriter
 import json
 import logging
 import os
@@ -443,7 +445,7 @@ def export_sold_csv(rows: list[SoldProperty], output_path: str | Path) -> str:
         "sale_amount", "in_my_records", "sale_month", "state", "county_filter",
     ]
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
+        writer = SafeDictWriter(f, fieldnames=fields)
         writer.writeheader()
         for r in rows:
             writer.writerow(asdict(r))
