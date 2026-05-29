@@ -581,6 +581,7 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
 
         # Now a list picker appears with "Search for lists..." input and a dropdown.
         # Type the list name to search, then click the matching option.
+        list_selected = False
         list_search = page.locator('input[placeholder*="Search for lists"]')
         if await list_search.count() > 0:
             await list_search.first.fill(list_name)
@@ -595,10 +596,24 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
                 await list_option.last.click()
                 await page.wait_for_timeout(1000)
                 logger.info("Selected list filter: %s", list_name)
+                list_selected = True
+            else:
+                logger.warning("List option '%s' not found in filter dropdown", list_name)
         else:
             logger.warning("'Search for lists...' input not found")
 
         await _screenshot(page, "filter_list_selected")
+
+        # Fail closed (W1-CR-01): if the named list was never actually selected,
+        # the grid is NOT narrowed to our list. Report failure so callers refuse
+        # to act on the full account rather than returning an optimistic True.
+        if not list_selected:
+            logger.error(
+                "Filter NOT confirmed — list '%s' was never selected; "
+                "treating as filter failure", list_name,
+            )
+            await _screenshot(page, "filter_not_confirmed")
+            return False
 
         # Click "Apply Filters" button at the bottom of the filter panel
         apply_btn = page.locator('text="Apply Filters"')
@@ -717,6 +732,35 @@ async def _select_all_records(page: Page) -> bool:
         return False
 
 
+# Owner-protection toggle states that count as "safe" (OFF). The enrich modal's
+# in-page JS reports each toggle as one of these strings.
+_OWNER_PROTECTION_TOGGLES = ("Enrich Owners", "Swap Owners")
+_TOGGLE_OFF_STATES = {"turned OFF", "already OFF"}
+
+
+def _owner_protection_confirmed(toggle_result: dict) -> tuple[bool, str]:
+    """Verify the owner-protection toggles were located AND set OFF (W1-CR-02).
+
+    Pure helper (no Playwright) so it is unit-testable. ``toggle_result`` is the
+    dict the enrich-modal JS returns (``{toggle_label: state}``). We must NOT click
+    "Enrich" unless BOTH "Enrich Owners" and "Swap Owners" were found and are OFF
+    — otherwise DataSift's modal defaults (which may be ON) would overwrite the
+    PR/DM contact mapping the probate pipeline computed. Returns ``(ok, reason)``.
+    """
+    located = set(toggle_result or {})
+    missing = [t for t in _OWNER_PROTECTION_TOGGLES if t not in located]
+    not_off = [
+        t for t in _OWNER_PROTECTION_TOGGLES
+        if t in located and (toggle_result or {}).get(t) not in _TOGGLE_OFF_STATES
+    ]
+    if missing or not_off:
+        return False, (
+            f"owner-protection toggles unconfirmed (missing={missing}, "
+            f"not_off={not_off})"
+        )
+    return True, "owner-protection toggles confirmed OFF"
+
+
 async def enrich_records(page: Page, list_name: str) -> dict:
     """Enrich uploaded records with DataSift's SiftMap property data.
 
@@ -743,9 +787,14 @@ async def enrich_records(page: Page, list_name: str) -> dict:
         # Filter to the uploaded list
         filtered = await _filter_by_list(page, list_name)
         if not filtered:
-            result["message"] = "Could not filter to list for enrichment"
-            logger.warning(result["message"])
-            # Continue anyway — may enrich whatever is showing
+            result["message"] = (
+                f"Aborting enrichment: could not confirm filter to list "
+                f"'{list_name}' — refusing to enrich unfiltered (full-account) "
+                f"records (W1-CR-01)"
+            )
+            logger.error(result["message"])
+            await _screenshot(page, "enrich_filter_failed_abort")
+            return result
 
         # Select all records
         selected = await _select_all_records(page)
@@ -838,6 +887,19 @@ async def enrich_records(page: Page, list_name: str) -> dict:
         logger.info("Enrichment toggles: %s", toggle_result)
         await page.wait_for_timeout(1000)
 
+        # Fail closed (W1-CR-02): confirm the owner-protection toggles were
+        # located AND set OFF. On label drift the JS above returns {} and we
+        # would otherwise click Enrich with the modal defaults, risking an
+        # account-wide overwrite of our PR/DM contact mapping.
+        ok, reason = _owner_protection_confirmed(toggle_result)
+        if not ok:
+            result["message"] = (
+                f"Aborting enrich: {reason} — refusing to risk DM contact overwrite"
+            )
+            logger.error(result["message"])
+            await _screenshot(page, "enrich_toggle_unverified_abort")
+            return result
+
         await _screenshot(page, "enrich_toggles_set")
 
         # Click "Enrich N Records" button to start processing
@@ -897,7 +959,14 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         # Filter to the uploaded list
         filtered = await _filter_by_list(page, list_name)
         if not filtered:
-            logger.warning("Could not filter to list for skip trace — continuing anyway")
+            result["message"] = (
+                f"Aborting skip trace: could not confirm filter to list "
+                f"'{list_name}' — refusing to skip-trace unfiltered (full-account) "
+                f"records (W1-CR-01)"
+            )
+            logger.error(result["message"])
+            await _screenshot(page, "skip_filter_failed_abort")
+            return result
 
         # Select all records
         selected = await _select_all_records(page)
