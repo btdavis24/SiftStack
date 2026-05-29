@@ -14,6 +14,14 @@ status_note: This code is ALREADY on main (PR #14). This is fix-forward, not a m
 
 # Remediation Plan v2 — SiftStack (fix-forward on `main`)
 
+> **✅ COMPLETE (2026-05-29) — all 11 actionable Criticals fixed + CR-04 refuted.**
+> 10 atomic commits on `brandon/dm-address-consolidation`, each test-first; 19/19
+> network-free test suites green. Commits: `23c4f0b` (W5-CR-01, W5-CR-02/CR-07),
+> `330e592` (W1-CR-01, W1-CR-02), `f70be17` (CR-05), `b26dceb` (CR-06),
+> `92cef4a` (W6-CR-01), `cd3180a` (CR-03), `1ef504e` (CR-01), `e70d347` (CR-02),
+> `34ead57` (W3-CR-01), `feb3c50` (review/plan docs). Remaining: the Wave 6
+> warning sweep + W6-WR-02 XLSX (warnings, not criticals).
+
 Goal: clear all **12 unique Criticals** (and their coupled warnings) found across the two review passes. The code already shipped to `main`, so the framing is **fix-forward, worst-blast-radius first** — not a pre-merge gate.
 
 **Test discipline (applies to every fix):** the suite is green but W8 proved **0 of the original 7 criticals are covered by a test that would fail if the bug were real** (5 fixture-masked, 2 untested). So every fix is test-first against the **live data shape** — not the fixture shape that currently dodges the bug.
